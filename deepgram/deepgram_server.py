@@ -316,11 +316,11 @@ class DeepgramSTT:
                         logger.error(f"Error in message handler: {e}", exc_info=True)
                 
                 # Connect to v2/listen endpoint for streaming
-                # Based on official docs: client.listen.v2.connect() but SDK 5.x may use different structure
+                # Based on official docs: client.listen.v2.connect() 
+                # Note: live is deprecated, use websocket instead
                 listen_obj = self.dg_client.listen
                 connection_context = None
                 
-                # Try multiple paths based on SDK structure and documentation
                 # Path 1: listen.v2 (official docs pattern)
                 if hasattr(listen_obj, 'v2'):
                     v2_obj = listen_obj.v2
@@ -332,43 +332,49 @@ class DeepgramSTT:
                         )
                         logger.debug("Using API path: listen.v2.connect")
                 
-                # Path 2: listen.live (alternative SDK structure)
-                if not connection_context and hasattr(listen_obj, 'live'):
-                    live_obj = listen_obj.live
-                    live_attrs = [attr for attr in dir(live_obj) if not attr.startswith('_')]
-                    logger.debug(f"Live attributes: {live_attrs}")
+                # Path 2: listen.websocket.v2 (recommended, websocket is not deprecated)
+                if not connection_context and hasattr(listen_obj, 'websocket'):
+                    websocket_obj = listen_obj.websocket
+                    websocket_attrs = [attr for attr in dir(websocket_obj) if not attr.startswith('_')]
+                    logger.debug(f"Websocket attributes: {websocket_attrs}")
                     
-                    # Check if live has v2
-                    if hasattr(live_obj, 'v2'):
-                        v2_obj = live_obj.v2
+                    # Check if websocket has v2
+                    if hasattr(websocket_obj, 'v2'):
+                        v2_obj = websocket_obj.v2
                         if hasattr(v2_obj, 'connect'):
                             connection_context = v2_obj.connect(
                                 model=self.model,
                                 encoding="linear16",
                                 sample_rate=str(sample_rate)
                             )
-                            logger.debug("Using API path: listen.live.v2.connect")
+                            logger.debug("Using API path: listen.websocket.v2.connect")
                     
-                    # Or direct connect/stream methods
-                    if not connection_context and hasattr(live_obj, 'connect'):
-                        connection_context = live_obj.connect(
-                            model=self.model,
-                            encoding="linear16",
-                            sample_rate=str(sample_rate)
-                        )
-                        logger.debug("Using API path: listen.live.connect")
-                    elif not connection_context and hasattr(live_obj, 'stream'):
-                        connection_context = live_obj.stream(
-                            model=self.model,
-                            encoding="linear16",
-                            sample_rate=str(sample_rate)
-                        )
-                        logger.debug("Using API path: listen.live.stream")
-                
-                # Path 3: listen.websocket (WebSocket-based streaming)
-                if not connection_context and hasattr(listen_obj, 'websocket'):
-                    websocket_obj = listen_obj.websocket
-                    if hasattr(websocket_obj, 'connect'):
+                    # Check if websocket has v (like live has)
+                    if not connection_context and hasattr(websocket_obj, 'v'):
+                        v_obj = websocket_obj.v
+                        v_attrs = [attr for attr in dir(v_obj) if not attr.startswith('_')]
+                        logger.debug(f"Websocket.v attributes: {v_attrs}")
+                        
+                        # Check if v has '2' or 'connect'
+                        if hasattr(v_obj, '2'):
+                            v2_obj = getattr(v_obj, '2')
+                            if hasattr(v2_obj, 'connect'):
+                                connection_context = v2_obj.connect(
+                                    model=self.model,
+                                    encoding="linear16",
+                                    sample_rate=str(sample_rate)
+                                )
+                                logger.debug("Using API path: listen.websocket.v.2.connect")
+                        elif hasattr(v_obj, 'connect'):
+                            connection_context = v_obj.connect(
+                                model=self.model,
+                                encoding="linear16",
+                                sample_rate=str(sample_rate)
+                            )
+                            logger.debug("Using API path: listen.websocket.v.connect")
+                    
+                    # Or direct connect method
+                    if not connection_context and hasattr(websocket_obj, 'connect'):
                         connection_context = websocket_obj.connect(
                             model=self.model,
                             encoding="linear16",
@@ -380,9 +386,12 @@ class DeepgramSTT:
                     # Log available attributes for debugging
                     listen_attrs = [attr for attr in dir(listen_obj) if not attr.startswith('_')]
                     logger.error(f"Available listen attributes: {listen_attrs}")
-                    if hasattr(listen_obj, 'live'):
-                        live_attrs = [attr for attr in dir(listen_obj.live) if not attr.startswith('_')]
-                        logger.error(f"Available live attributes: {live_attrs}")
+                    if hasattr(listen_obj, 'websocket'):
+                        websocket_attrs = [attr for attr in dir(listen_obj.websocket) if not attr.startswith('_')]
+                        logger.error(f"Available websocket attributes: {websocket_attrs}")
+                        if hasattr(listen_obj.websocket, 'v'):
+                            v_attrs = [attr for attr in dir(listen_obj.websocket.v) if not attr.startswith('_')]
+                            logger.error(f"Available websocket.v attributes: {v_attrs}")
                     raise AttributeError("Could not find Deepgram streaming API path. Please check SDK version.")
                 
                 with connection_context as connection:
@@ -650,11 +659,11 @@ class StreamingSession:
             
             try:
                 # Connect to v2/listen endpoint for streaming
-                # Based on official docs: client.listen.v2.connect() but SDK 5.x may use different structure
+                # Based on official docs: client.listen.v2.connect() 
+                # Note: live is deprecated, use websocket instead
                 listen_obj = self.dg_client.listen
                 connection_context = None
                 
-                # Try multiple paths based on SDK structure and documentation
                 # Path 1: listen.v2 (official docs pattern)
                 if hasattr(listen_obj, 'v2'):
                     v2_obj = listen_obj.v2
@@ -666,43 +675,49 @@ class StreamingSession:
                         )
                         logger.debug("Using API path: listen.v2.connect")
                 
-                # Path 2: listen.live (alternative SDK structure)
-                if not connection_context and hasattr(listen_obj, 'live'):
-                    live_obj = listen_obj.live
-                    live_attrs = [attr for attr in dir(live_obj) if not attr.startswith('_')]
-                    logger.debug(f"Live attributes: {live_attrs}")
+                # Path 2: listen.websocket.v2 (recommended, websocket is not deprecated)
+                if not connection_context and hasattr(listen_obj, 'websocket'):
+                    websocket_obj = listen_obj.websocket
+                    websocket_attrs = [attr for attr in dir(websocket_obj) if not attr.startswith('_')]
+                    logger.debug(f"Websocket attributes: {websocket_attrs}")
                     
-                    # Check if live has v2
-                    if hasattr(live_obj, 'v2'):
-                        v2_obj = live_obj.v2
+                    # Check if websocket has v2
+                    if hasattr(websocket_obj, 'v2'):
+                        v2_obj = websocket_obj.v2
                         if hasattr(v2_obj, 'connect'):
                             connection_context = v2_obj.connect(
                                 model=self.model,
                                 encoding="linear16",
                                 sample_rate="16000"
                             )
-                            logger.debug("Using API path: listen.live.v2.connect")
+                            logger.debug("Using API path: listen.websocket.v2.connect")
                     
-                    # Or direct connect/stream methods
-                    if not connection_context and hasattr(live_obj, 'connect'):
-                        connection_context = live_obj.connect(
-                            model=self.model,
-                            encoding="linear16",
-                            sample_rate="16000"
-                        )
-                        logger.debug("Using API path: listen.live.connect")
-                    elif not connection_context and hasattr(live_obj, 'stream'):
-                        connection_context = live_obj.stream(
-                            model=self.model,
-                            encoding="linear16",
-                            sample_rate="16000"
-                        )
-                        logger.debug("Using API path: listen.live.stream")
-                
-                # Path 3: listen.websocket (WebSocket-based streaming)
-                if not connection_context and hasattr(listen_obj, 'websocket'):
-                    websocket_obj = listen_obj.websocket
-                    if hasattr(websocket_obj, 'connect'):
+                    # Check if websocket has v (like live has)
+                    if not connection_context and hasattr(websocket_obj, 'v'):
+                        v_obj = websocket_obj.v
+                        v_attrs = [attr for attr in dir(v_obj) if not attr.startswith('_')]
+                        logger.debug(f"Websocket.v attributes: {v_attrs}")
+                        
+                        # Check if v has '2' or 'connect'
+                        if hasattr(v_obj, '2'):
+                            v2_obj = getattr(v_obj, '2')
+                            if hasattr(v2_obj, 'connect'):
+                                connection_context = v2_obj.connect(
+                                    model=self.model,
+                                    encoding="linear16",
+                                    sample_rate="16000"
+                                )
+                                logger.debug("Using API path: listen.websocket.v.2.connect")
+                        elif hasattr(v_obj, 'connect'):
+                            connection_context = v_obj.connect(
+                                model=self.model,
+                                encoding="linear16",
+                                sample_rate="16000"
+                            )
+                            logger.debug("Using API path: listen.websocket.v.connect")
+                    
+                    # Or direct connect method
+                    if not connection_context and hasattr(websocket_obj, 'connect'):
                         connection_context = websocket_obj.connect(
                             model=self.model,
                             encoding="linear16",
@@ -714,9 +729,12 @@ class StreamingSession:
                     # Log available attributes for debugging
                     listen_attrs = [attr for attr in dir(listen_obj) if not attr.startswith('_')]
                     logger.error(f"Available listen attributes: {listen_attrs}")
-                    if hasattr(listen_obj, 'live'):
-                        live_attrs = [attr for attr in dir(listen_obj.live) if not attr.startswith('_')]
-                        logger.error(f"Available live attributes: {live_attrs}")
+                    if hasattr(listen_obj, 'websocket'):
+                        websocket_attrs = [attr for attr in dir(listen_obj.websocket) if not attr.startswith('_')]
+                        logger.error(f"Available websocket attributes: {websocket_attrs}")
+                        if hasattr(listen_obj.websocket, 'v'):
+                            v_attrs = [attr for attr in dir(listen_obj.websocket.v) if not attr.startswith('_')]
+                            logger.error(f"Available websocket.v attributes: {v_attrs}")
                     raise AttributeError("Could not find Deepgram streaming API path. Please check SDK version.")
                 
                 self.connection_context = connection_context
