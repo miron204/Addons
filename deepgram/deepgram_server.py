@@ -513,45 +513,73 @@ class StreamingSession:
         def run_streaming():
             def on_message(message):
                 """Handle incoming transcript messages - send progressive updates like faster-whisper"""
+                logger.info(f"🔔 StreamingSession.on_message CALLED! Message type: {type(message).__name__}")
                 try:
                     transcript_text = None
                     
                     # Check message type and extract transcript (same pattern as _transcribe_flux_streaming)
                     msg_type_name = type(message).__name__
                     msg_type_attr = getattr(message, 'type', None)
-                    logger.debug(f"📨 Streaming message: class={msg_type_name}, type={msg_type_attr}")
+                    logger.info(f"📨 StreamingSession.on_message processing: class={msg_type_name}, type={msg_type_attr}")
+                    logger.debug(f"Message attributes: {[attr for attr in dir(message) if not attr.startswith('_')]}")
                     
                     # Filter out connection and error events
                     if 'Connected' in msg_type_name or 'Error' in msg_type_name or 'Fatal' in msg_type_name:
-                        if 'Error' in msg_type_name or 'Fatal' in msg_type_name:
+                        if 'Connected' in msg_type_name:
+                            # Connection is ready - signal the async event loop
+                            logger.debug("Connection established, setting streaming_ready")
+                            loop.call_soon_threadsafe(self.streaming_ready.set)
+                        elif 'Error' in msg_type_name or 'Fatal' in msg_type_name:
                             error_code = getattr(message, 'code', None)
                             error_desc = getattr(message, 'description', None)
                             logger.error(f"❌ Deepgram streaming error: code={error_code}, description={error_desc}")
                         return
                     
                     # Check if this is a final result (not interim)
-                    is_final = getattr(message, 'is_final', None)
-                    if is_final is False:
-                        logger.debug("Received interim transcript in streaming (will buffer, not emit yet)")
+                    # Try multiple ways to detect is_final
+                    is_final = None
+                    if hasattr(message, 'is_final'):
+                        is_final = getattr(message, 'is_final')
+                    elif hasattr(message, 'channel') and hasattr(message.channel, 'alternatives') and len(message.channel.alternatives) > 0:
+                        alt = message.channel.alternatives[0]
+                        if hasattr(alt, 'is_final'):
+                            is_final = getattr(alt, 'is_final')
                     
-                    # Try different message formats to extract transcript
-                    if hasattr(message, 'channel') and hasattr(message.channel, 'alternatives'):
-                        for alt in message.channel.alternatives:
-                            if hasattr(alt, 'transcript'):
-                                transcript_text = getattr(alt, 'transcript', None)
-                                break
-                    elif hasattr(message, 'transcript'):
+                    logger.debug(f"  is_final detection: {is_final} (type: {type(is_final)})")
+                    # Process both interim and final - send all updates like Faster-Whisper
+                    
+                    # Try different message formats to extract transcript (matching _transcribe_flux_streaming)
+                    logger.debug(f"  Message attributes: {[attr for attr in dir(message) if not attr.startswith('_') and not callable(getattr(message, attr, None))]}")
+                    
+                    # Check for channel.alternatives pattern (most common for v2 API)
+                    if hasattr(message, 'channel'):
+                        channel = message.channel
+                        logger.debug(f"  Found channel: {channel}")
+                        if hasattr(channel, 'alternatives') and len(channel.alternatives) > 0:
+                            alt = channel.alternatives[0]
+                            logger.debug(f"  Alternative: {alt}")
+                            transcript_text = getattr(alt, 'transcript', None)
+                            if transcript_text:
+                                logger.info(f"✅ Found transcript in channel.alternatives: {transcript_text[:50]}...")
+                    
+                    # Check for direct transcript attribute
+                    if not transcript_text and hasattr(message, 'transcript'):
                         transcript_text = message.transcript
-                    elif isinstance(message, str):
-                        transcript_text = message
-                    elif isinstance(message, dict):
-                        if message.get('is_final', True):
-                            transcript_text = message.get('transcript') or message.get('text')
+                        logger.info(f"✅ Found transcript in message.transcript: {transcript_text[:50]}...")
+                    
+                    # Check if message itself is a string or dict
+                    if not transcript_text:
+                        if isinstance(message, str):
+                            transcript_text = message
+                        elif isinstance(message, dict):
+                            if message.get('is_final', True):
+                                transcript_text = message.get('transcript') or message.get('text')
                     
                     if transcript_text and transcript_text.strip():
                         text = transcript_text.strip()
                         with self._lock:
-                            final_flag = bool(is_final)
+                            # Treat None as interim (send it), only False means skip
+                            final_flag = bool(is_final) if is_final is not None else False
                             old_length = len(self.final_transcript) if self.final_transcript else 0
                             new_length = len(text)
                             
@@ -594,8 +622,20 @@ class StreamingSession:
                 self.end_of_turn.set()
 
             def on_end_of_turn(_):
-                logger.debug("EndOfTurn received")
+                logger.info("🔚 EndOfTurn received - sending final transcript")
                 self.end_of_turn.set()
+                # Send the final transcript when EndOfTurn is received
+                with self._lock:
+                    if self.final_transcript and not self.final_sent:
+                        try:
+                            asyncio.run_coroutine_threadsafe(
+                                self.transcript_callback(self.final_transcript, True),  # final=True
+                                self.event_loop
+                            )
+                            self.final_sent = True
+                            logger.info(f"📤 Sent FINAL transcript on EndOfTurn: {self.final_transcript[:80]}...")
+                        except Exception as e:
+                            logger.error(f"Error sending final transcript on EndOfTurn: {e}", exc_info=True)
             
             try:
                 # Connect to v2/listen endpoint for streaming using SDK 5.3.0+ pattern
@@ -610,35 +650,45 @@ class StreamingSession:
                 self.connection = self.connection_context.__enter__()
                 logger.info("Connected to Deepgram streaming API")
                 
-                # Use EventType from deepgram.core.events as per official docs
+                # Register event handlers BEFORE calling start_listening() (per official docs pattern)
+                logger.info("Registering event handlers...")
                 try:
-                    self.connection.on(EventType.OPEN, lambda _: logger.debug("Streaming connection opened"))
+                    self.connection.on(EventType.OPEN, lambda _: logger.info("🔵 Connection OPEN event received"))
                     self.connection.on(EventType.MESSAGE, on_message)
                     self.connection.on(EventType.CLOSE, on_close)
                     self.connection.on(EventType.ERROR, on_error)
                     if hasattr(EventType, 'END_OF_TURN'):
                         self.connection.on(EventType.END_OF_TURN, on_end_of_turn)
+                    logger.info("✅ Registered handlers using EventType")
                 except (ImportError, AttributeError) as e:
-                    logger.debug(f"Using EventType failed: {e}, trying fallback")
+                    logger.warning(f"EventType registration failed: {e}, trying string-based fallback")
                     # Fallback to string-based event names
-                    self.connection.on("open", lambda _: logger.debug("Streaming connection opened"))
+                    self.connection.on("open", lambda _: logger.info("🔵 Connection OPEN event received"))
                     self.connection.on("message", on_message)
                     self.connection.on("close", on_close)
                     self.connection.on("error", on_error)
                     self.connection.on("end_of_turn", on_end_of_turn)
+                    logger.info("✅ Registered handlers using string-based events")
                 
-                # Start listening for messages (per Deepgram docs, call before sending)
-                self.listening_thread = threading.Thread(target=self.connection.start_listening, daemon=True)
-                self.listening_thread.start()
-                time.sleep(0.1)  # Give it a moment to start
-                
-                logger.info("✅ Streaming connection established and listening")
-                
-                # Signal that connection is ready (set event in async context)
-                asyncio.run_coroutine_threadsafe(
-                    self.streaming_ready.set(),
-                    loop
+                # Start listening for messages (per Deepgram docs: call AFTER registering handlers, BEFORE sending audio)
+                logger.info("Starting message listener (blocking call in thread)...")
+                self.listening_thread = threading.Thread(
+                    target=self.connection.start_listening, 
+                    daemon=True,
+                    name="DeepgramListener"
                 )
+                self.listening_thread.start()
+                time.sleep(0.1)  # Minimal wait for listener thread to start (reduced from 0.3s)
+                
+                # Verify listener thread is running
+                if self.listening_thread.is_alive():
+                    logger.info("✅ Streaming connection established and listening (ready for audio)")
+                else:
+                    logger.error("❌ Listener thread died immediately - check for errors above")
+                    raise RuntimeError("Failed to start Deepgram listener thread")
+                
+                # Note: streaming_ready event is set when OPEN event is received (in on_message handler)
+                # We don't set it here to avoid race conditions
             except Exception as e:
                 logger.error(f"Error starting streaming connection: {e}", exc_info=True)
                 raise
@@ -774,6 +824,7 @@ class EventHandler(AsyncEventHandler):
         self.streaming_connection = None  # For streaming mode
         self.streaming_active = False
         self.streaming_transcript = ""
+        self.streaming_ready = False  # Track if connection is ready (avoid repeated waits)
         wyoming_info = self.WYOMING_INFO
         self.wyoming_info_event = wyoming_info.event()
 
@@ -793,7 +844,8 @@ class EventHandler(AsyncEventHandler):
             if self.stt.is_flux:
                 try:
                     self.streaming_transcript = ""
-                    # Define callback to capture progressive transcripts (stored until final send)
+                    self.streaming_ready = False  # Reset ready flag for new connection
+                    # Define callback to capture progressive transcripts (send immediately like faster-whisper)
                     async def send_transcript(text: str, is_final: bool):
                         self.streaming_transcript = text
                         result_event = Event(
@@ -801,17 +853,23 @@ class EventHandler(AsyncEventHandler):
                             data={"text": text, "final": is_final},
                         )
                         await self._safe_write_event(result_event)
-                        logger.debug(f"📤 Sent streaming transcript update: {text[:50]}...")
+                        logger.info(f"📤 Sent streaming transcript ({'FINAL' if is_final else 'interim'}): {text[:80]}...")
                     
+                    logger.info(f"🔄 Starting streaming connection for Flux model...")
                     self.streaming_connection = await self.stt.start_streaming(
                         self.sample_rate, 
                         send_transcript
                     )
                     self.streaming_active = True
-                    logger.info("✅ Started streaming transcription")
+                    # Wait for connection to be ready (only once at start)
+                    # Reduced timeout since connection should be ready quickly after OPEN event
+                    await self.streaming_connection.wait_for_ready(timeout=0.5)
+                    self.streaming_ready = True
+                    logger.info("✅ Started streaming transcription - ready to receive audio chunks")
                 except Exception as e:
-                    logger.error(f"Failed to start streaming: {e}", exc_info=True)
+                    logger.error(f"❌ Failed to start streaming: {e}", exc_info=True)
                     self.streaming_active = False
+                    # Fallback: will use batch mode on audio-stop
             else:
                 # For non-Flux models, use batch mode
                 self.streaming_active = False
@@ -820,14 +878,18 @@ class EventHandler(AsyncEventHandler):
             if self.streaming_active and self.streaming_connection:
                 # Streaming mode: send chunk immediately to Deepgram
                 try:
-                    # Wait for connection to be ready before sending (prevents race condition)
-                    await self.streaming_connection.wait_for_ready(timeout=2.0)
+                    # Only wait if connection not yet ready (should be ready from audio-start)
+                    if not self.streaming_ready:
+                        await self.streaming_connection.wait_for_ready(timeout=0.5)
+                        self.streaming_ready = True
                     
                     chunk = event.payload
+                    chunk_size = len(chunk) if chunk else 0
                     
                     # Flux requires 80ms chunks, but we'll send as received and let Deepgram handle it
                     # Send chunk directly (StreamingSession handles thread safety)
                     self.streaming_connection.send_media(chunk)
+                    logger.debug(f"📤 Sent audio chunk to Deepgram: {chunk_size} bytes")
                 except Exception as e:
                     logger.error(f"Error processing streaming audio chunk: {e}", exc_info=True)
             else:
@@ -840,29 +902,52 @@ class EventHandler(AsyncEventHandler):
                 # Streaming mode: finalize the stream
                 try:
                     session = self.streaming_connection
-                    
-                    # Wait for connection to be ready before finalizing (prevents race condition)
-                    await session.wait_for_ready(timeout=2.0)
-                    
-                    # Close the streaming connection (in executor since it's sync)
                     loop = asyncio.get_event_loop()
                     
                     # Send final chunk if any remaining audio
                     if self.audio_data:
                         session.send_media(self.audio_data)
                     
-                    # Wait briefly for EndOfTurn/final events before closing (in case more arrive)
+                    # Tell Deepgram we're done sending audio (triggers final transcript messages)
+                    def finish_stream():
+                        try:
+                            if session.connection and hasattr(session.connection, 'finish'):
+                                session.connection.finish()
+                                logger.debug("Called connection.finish() to signal end of audio")
+                        except Exception as e:
+                            logger.debug(f"connection.finish() raised error: {e}")
+                    
+                    await loop.run_in_executor(None, finish_stream)
+                    
+                    # Wait for Deepgram to finish processing and send final transcript
+                    # This ensures we get the complete, refined transcript before marking as final
                     def wait_for_end():
-                        return session.wait_for_completion(timeout=3.0)
+                        return session.wait_for_completion(timeout=1.0)  # Wait 1s for final processing
 
                     completed = await loop.run_in_executor(None, wait_for_end)
                     if not completed:
-                        logger.debug("Timed out waiting for EndOfTurn; closing stream anyway")
+                        logger.debug("EndOfTurn not received (timeout), using latest transcript")
                     
-                    # Get the final transcript
+                    # Get the final transcript after Deepgram has finished processing
                     final_transcript = session.get_final_transcript().strip()
                     if not final_transcript:
                         final_transcript = self.streaming_transcript.strip()
+                    
+                    logger.info(f"📋 Final transcript after processing: '{final_transcript}' (length: {len(final_transcript)})")
+                    logger.info(f"📋 Last streaming transcript: '{self.streaming_transcript}' (length: {len(self.streaming_transcript)})")
+                    
+                    # Always send final transcript (even if we sent interim versions)
+                    # This ensures the client gets the complete, final version
+                    if final_transcript:
+                        result_event = Event(
+                            type="transcript",
+                            data={"text": final_transcript, "final": True},
+                        )
+                        logger.info(f"📤 Sending FINAL transcript: {final_transcript[:80]}...")
+                        await self._safe_write_event(result_event)
+                        session.final_sent = True
+                    else:
+                        logger.warning("No final transcript available after processing")
                     
                     # Close the connection
                     def close_stream():
@@ -873,22 +958,9 @@ class EventHandler(AsyncEventHandler):
                     
                     await loop.run_in_executor(None, close_stream)
                     self.streaming_active = False
+                    self.streaming_ready = False  # Reset ready flag
                     self.audio_data = b""
                     logger.info("✅ Streaming transcription finalized")
-
-                    # Only send final transcript if we haven't already sent it during streaming
-                    final_already_sent = getattr(session, "final_sent", False)
-                    if not final_already_sent and final_transcript:
-                        result_event = Event(
-                            type="transcript",
-                            data={"text": final_transcript, "final": True},
-                        )
-                        logger.info(f"Sending Transcript Event: {final_transcript}")
-                        await self._safe_write_event(result_event)
-                    elif not final_transcript:
-                        logger.warning("Streaming completed but no transcript was produced.")
-                    else:
-                        logger.debug("Final transcript already sent during streaming; skipping duplicate.")
                     
                     self.streaming_transcript = ""
                     self.streaming_connection = None
