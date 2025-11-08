@@ -240,9 +240,33 @@ class StreamingSession:
             # Check if audio_data is WAV (has RIFF header) or raw PCM
             is_wav = audio_data[:4] == b'RIFF'
             
+            # Try different API paths for Deepgram SDK 5.x
+            # The SDK structure may vary between versions
+            api_path = None
+            
+            # Check available attributes to determine correct path
+            if hasattr(self.dg_client, 'listen'):
+                listen_obj = self.dg_client.listen
+                # Check if v1 exists directly
+                if hasattr(listen_obj, 'v1'):
+                    api_path = listen_obj.v1.media.transcribe_file
+                # Check if rest exists
+                elif hasattr(self.dg_client, 'rest') and hasattr(self.dg_client.rest, 'v1'):
+                    api_path = self.dg_client.rest.v1.listen.media.transcribe_file
+                # Try alternative path
+                elif hasattr(listen_obj, 'rest') and hasattr(listen_obj.rest, 'v1'):
+                    api_path = listen_obj.rest.v1.media.transcribe_file
+                else:
+                    # Log available attributes for debugging
+                    logger.error(f"Available listen attributes: {[attr for attr in dir(listen_obj) if not attr.startswith('_')]}")
+                    logger.error(f"Available dg_client attributes: {[attr for attr in dir(self.dg_client) if not attr.startswith('_')]}")
+                    raise AttributeError("Could not find Deepgram v1 API path. Please check SDK version.")
+            else:
+                raise AttributeError("Deepgram client does not have 'listen' attribute")
+            
             if is_wav:
                 # WAV file - SDK auto-detects format
-                response = self.dg_client.listen.v1.media.transcribe_file(
+                response = api_path(
                     request=audio_data,
                     model=self.model,
                     smart_format=True,
@@ -269,7 +293,7 @@ class StreamingSession:
                 )
                 wav_data = wav_header + audio_data
                 
-                response = self.dg_client.listen.v1.media.transcribe_file(
+                response = api_path(
                     request=wav_data,
                     model=self.model,
                     smart_format=True,
