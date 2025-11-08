@@ -926,7 +926,32 @@ class EventHandler(AsyncEventHandler):
                     session = self.streaming_connection
                     loop = asyncio.get_event_loop()
                     
-                    # Send final chunk if any remaining audio
+                    # CRITICAL: Get and send transcript IMMEDIATELY before any blocking operations
+                    # Home Assistant's STT provider waits for the first Transcript event after audio-stop
+                    # If it doesn't receive one quickly, it may timeout and disconnect
+                    # We MUST send the transcript synchronously before doing anything else
+                    latest_transcript = session.get_final_transcript().strip()
+                    if not latest_transcript:
+                        latest_transcript = self.streaming_transcript.strip()
+                    
+                    # Send immediately as FINAL - HA expects final=True when audio stops
+                    # This must be sent BEFORE finish_stream() to ensure HA receives it
+                    if latest_transcript:
+                        result_event = Event(
+                            type="transcript",
+                            data={"text": latest_transcript, "final": True},
+                        )
+                        # Use write_event directly (not _safe_write_event) to ensure it's sent immediately
+                        # We want to know if there's an error sending it
+                        try:
+                            await self.write_event(result_event)
+                            logger.info(f"📤 Sent IMMEDIATE final transcript: {latest_transcript[:80]}...")
+                            session.final_sent = True
+                        except (BrokenPipeError, ConnectionResetError, TypeError) as e:
+                            logger.warning(f"Failed to send immediate transcript (client may have disconnected): {e}")
+                            # Client already disconnected, but continue to clean up
+                    
+                    # Send final chunk if any remaining audio (after sending transcript)
                     if self.audio_data:
                         session.send_media(self.audio_data)
                     
@@ -938,22 +963,6 @@ class EventHandler(AsyncEventHandler):
                                 logger.debug("Called connection.finish() to signal end of audio")
                         except Exception as e:
                             logger.debug(f"connection.finish() raised error: {e}")
-                    
-                    # CRITICAL: Send latest transcript IMMEDIATELY to prevent Home Assistant timeout
-                    # Home Assistant disconnects after ~3s if no transcript is received
-                    # Send whatever we have NOW, then refine it later
-                    latest_transcript = session.get_final_transcript().strip()
-                    if not latest_transcript:
-                        latest_transcript = self.streaming_transcript.strip()
-                    
-                    if latest_transcript:
-                        # Send immediately to keep connection alive
-                        result_event = Event(
-                            type="transcript",
-                            data={"text": latest_transcript, "final": False},  # Mark as interim initially
-                        )
-                        await self._safe_write_event(result_event)
-                        logger.info(f"📤 Sent IMMEDIATE transcript (to prevent HA timeout): {latest_transcript[:80]}...")
                     
                     await loop.run_in_executor(None, finish_stream)
                     
@@ -975,25 +984,24 @@ class EventHandler(AsyncEventHandler):
                     logger.info(f"📋 Final transcript after processing: '{final_transcript}' (length: {len(final_transcript)})")
                     logger.info(f"📋 Last streaming transcript: '{self.streaming_transcript}' (length: {len(self.streaming_transcript)})")
                     
-                    # Send final refined transcript (mark as final even if same as immediate)
+                    # Only send refined transcript if it's different from what we already sent
+                    # Home Assistant may have already disconnected, but we'll try to send the refined version
                     if final_transcript:
-                        if final_transcript != latest_transcript:
-                            # Different transcript - send the refined version
+                        if latest_transcript and final_transcript == latest_transcript:
+                            # Same transcript - already sent, no need to send again
+                            logger.debug(f"Final transcript unchanged, already sent: {final_transcript[:50]}...")
+                        else:
+                            # Different transcript OR no immediate was sent - send the refined/final version
                             result_event = Event(
                                 type="transcript",
                                 data={"text": final_transcript, "final": True},
                             )
-                            logger.info(f"📤 Sending FINAL refined transcript: {final_transcript[:80]}...")
+                            if latest_transcript:
+                                logger.info(f"📤 Sending REFINED final transcript: {final_transcript[:80]}...")
+                            else:
+                                logger.info(f"📤 Sending final transcript (no immediate was sent): {final_transcript[:80]}...")
                             await self._safe_write_event(result_event)
-                        elif latest_transcript:
-                            # Same transcript - just mark the previous one as final
-                            result_event = Event(
-                                type="transcript",
-                                data={"text": final_transcript, "final": True},
-                            )
-                            logger.info(f"📤 Marking transcript as FINAL: {final_transcript[:80]}...")
-                            await self._safe_write_event(result_event)
-                        session.final_sent = True
+                            session.final_sent = True
                     else:
                         logger.warning("No final transcript available after processing")
                     
