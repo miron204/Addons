@@ -784,7 +784,9 @@ class EventHandler(AsyncEventHandler):
                     # Define callback to capture progressive transcripts (stored until final send)
                     async def send_transcript(text: str):
                         self.streaming_transcript = text
-                        logger.debug(f"📥 Updated streaming transcript buffer: {text[:50]}...")
+                        result_event = Event(type="transcript", data={"text": text})
+                        await self._safe_write_event(result_event)
+                        logger.debug(f"📤 Sent streaming transcript update: {text[:50]}...")
                     
                     self.streaming_connection = await self.stt.start_streaming(
                         self.sample_rate, 
