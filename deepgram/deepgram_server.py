@@ -399,6 +399,13 @@ class DeepgramSTT:
                             logger.debug(f"Sent chunk {chunk_count}: {len(chunk)} bytes")
                     
                     
+                    if hasattr(connection, 'finish'):
+                        try:
+                            connection.finish()
+                            logger.debug("Called connection.finish() after sending audio")
+                        except Exception as e:
+                            logger.debug(f"connection.finish() raised error: {e}")
+                    
                     logger.info(f"Finished sending {chunk_count} chunks, total {bytes_sent} bytes")
                     logger.info(f"Finished sending audio data, waiting for transcript...")
                     
@@ -657,6 +664,13 @@ class StreamingSession:
     
     def close(self):
         """Close the streaming connection"""
+        if self.connection and hasattr(self.connection, 'finish'):
+            try:
+                self.connection.finish()
+                logger.debug("Called connection.finish() before closing stream")
+            except Exception as e:
+                logger.debug(f"connection.finish() raised error: {e}")
+        
         if self.connection_context and self.connection:
             try:
                 # SDK 5.3.0+ uses context manager __exit__ to close
