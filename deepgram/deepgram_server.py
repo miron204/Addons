@@ -530,8 +530,7 @@ class StreamingSession:
                     # Check if this is a final result (not interim)
                     is_final = getattr(message, 'is_final', None)
                     if is_final is False:
-                        logger.debug("Ignoring interim transcript in streaming")
-                        return
+                        logger.debug("Received interim transcript in streaming (will buffer, not emit yet)")
                     
                     # Try different message formats to extract transcript
                     if hasattr(message, 'channel') and hasattr(message.channel, 'alternatives'):
