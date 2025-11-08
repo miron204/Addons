@@ -762,6 +762,7 @@ class EventHandler(AsyncEventHandler):
         self.sample_rate = 16000  # Default sample rate; can be adjusted
         self.streaming_connection = None  # For streaming mode
         self.streaming_active = False
+        self.streaming_transcript = ""
         wyoming_info = self.WYOMING_INFO
         self.wyoming_info_event = wyoming_info.event()
 
@@ -780,11 +781,10 @@ class EventHandler(AsyncEventHandler):
             # For Flux models, start streaming connection
             if self.stt.is_flux:
                 try:
-                    # Define callback to send progressive transcripts
+                    # Define callback to capture progressive transcripts (stored until final send)
                     async def send_transcript(text: str):
-                        result_event = Event(type="transcript", data={"text": text})
-                        await self._safe_write_event(result_event)
-                        logger.debug(f"📤 Sent streaming transcript: {text[:50]}...")
+                        self.streaming_transcript = text
+                        logger.debug(f"📥 Updated streaming transcript buffer: {text[:50]}...")
                     
                     self.streaming_connection = await self.stt.start_streaming(
                         self.sample_rate, 
@@ -849,6 +849,8 @@ class EventHandler(AsyncEventHandler):
                     self.streaming_connection = None
                     self.streaming_active = False
                     self.audio_data = b""
+                    final_transcript = final_transcript or self.streaming_transcript.strip()
+                    self.streaming_transcript = ""
                     logger.info("✅ Streaming transcription finalized")
 
                     if final_transcript:
