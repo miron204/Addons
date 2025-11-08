@@ -920,9 +920,10 @@ class EventHandler(AsyncEventHandler):
                     await loop.run_in_executor(None, finish_stream)
                     
                     # Wait for Deepgram to finish processing and send final transcript
-                    # This ensures we get the complete, refined transcript before marking as final
+                    # Reduced timeout to match faster-whisper's responsiveness (0.5s)
+                    # We already send progressive updates, so we just need a brief wait for final refinement
                     def wait_for_end():
-                        return session.wait_for_completion(timeout=1.0)  # Wait 1s for final processing
+                        return session.wait_for_completion(timeout=0.5)  # Fast like faster-whisper
 
                     completed = await loop.run_in_executor(None, wait_for_end)
                     if not completed:
