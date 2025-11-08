@@ -683,6 +683,14 @@ class State:
             del self.sessions[session_id]
 
 class EventHandler(AsyncEventHandler):
+    async def _safe_write_event(self, event: Event) -> None:
+        """Send event to Wyoming client, ignoring disconnect-related errors."""
+        try:
+            await self.write_event(event)
+        except (BrokenPipeError, ConnectionResetError) as exc:
+            logger.warning(f"Client disconnected before event delivery: {exc}")
+        except Exception as exc:
+            logger.error(f"Unexpected error sending event: {exc}", exc_info=True)
     WYOMING_INFO = Info(
         asr=[
             AsrProgram(
@@ -761,7 +769,7 @@ class EventHandler(AsyncEventHandler):
                     # Define callback to send progressive transcripts
                     async def send_transcript(text: str):
                         result_event = Event(type="transcript", data={"text": text})
-                        await self.write_event(result_event)
+                        await self._safe_write_event(result_event)
                         logger.debug(f"📤 Sent streaming transcript: {text[:50]}...")
                     
                     self.streaming_connection = await self.stt.start_streaming(
@@ -832,7 +840,7 @@ class EventHandler(AsyncEventHandler):
                     if final_transcript:
                         result_event = Event(type="transcript", data={"text": final_transcript})
                         logger.info(f"Sending Transcript Event: {final_transcript}")
-                        await self.write_event(result_event)
+                        await self._safe_write_event(result_event)
                     else:
                         logger.warning("Streaming completed but no transcript was produced.")
                 except Exception as e:
@@ -844,7 +852,7 @@ class EventHandler(AsyncEventHandler):
                 
                 logger.info(f"Sending Transcript Event: {text}")
                 
-                await self.write_event(result_event)
+                await self._safe_write_event(result_event)
                 self.audio_data = b""  # Reset for next transcription
         else:
             logger.info(f"Received Wyoming event: {event.type} - Data: {event.data}")
