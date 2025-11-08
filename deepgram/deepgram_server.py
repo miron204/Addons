@@ -4,6 +4,7 @@ import os
 import logging
 import threading
 import struct
+import time
 from deepgram import DeepgramClient
 from wyoming.event import Event
 from wyoming.server import AsyncEventHandler, AsyncServer
@@ -27,6 +28,192 @@ class DeepgramSTT:
         self.dg_client = DeepgramClient(api_key=deepgram_api_key)
         self.model = model
         self.is_flux = model.startswith("flux")
+    
+    async def start_streaming(self, sample_rate: int, transcript_callback):
+        """
+        Start a streaming transcription session.
+        Returns a StreamingSession object that can be used to send audio chunks.
+        """
+        if not self.is_flux:
+            raise ValueError("Streaming is only supported for Flux models")
+        
+        loop = asyncio.get_event_loop()
+        
+        # Create a session object to manage the connection
+        session = StreamingSession(self.dg_client, self.model, transcript_callback, loop)
+        await session.start()
+        return session
+
+
+class StreamingSession:
+    """Manages a streaming Deepgram connection"""
+    def __init__(self, dg_client, model, transcript_callback, event_loop):
+        self.dg_client = dg_client
+        self.model = model
+        self.transcript_callback = transcript_callback
+        self.event_loop = event_loop
+        self.connection = None
+        self.connection_context = None
+        self.final_transcript = ""
+        self.last_sent_transcript = ""
+        self.listening_thread = None
+        self._lock = threading.Lock()
+    
+    async def start(self):
+        """Start the streaming connection - following faster-whisper pattern"""
+        loop = asyncio.get_event_loop()
+        
+        def run_streaming():
+            def on_message(message):
+                """Handle incoming transcript messages - send progressive updates like faster-whisper"""
+                try:
+                    transcript_text = None
+                    
+                    # Check message type and extract transcript (same pattern as _transcribe_flux_streaming)
+                    msg_type_name = type(message).__name__
+                    msg_type_attr = getattr(message, 'type', None)
+                    logger.debug(f"📨 Streaming message: class={msg_type_name}, type={msg_type_attr}")
+                    
+                    # Filter out connection and error events
+                    if 'Connected' in msg_type_name or 'Error' in msg_type_name or 'Fatal' in msg_type_name:
+                        if 'Error' in msg_type_name or 'Fatal' in msg_type_name:
+                            error_code = getattr(message, 'code', None)
+                            error_desc = getattr(message, 'description', None)
+                            logger.error(f"❌ Deepgram streaming error: code={error_code}, description={error_desc}")
+                        return
+                    
+                    # Check if this is a final result (not interim)
+                    is_final = getattr(message, 'is_final', None)
+                    if is_final is False:
+                        logger.debug("Ignoring interim transcript in streaming")
+                        return
+                    
+                    # Try different message formats to extract transcript
+                    if hasattr(message, 'channel') and hasattr(message.channel, 'alternatives'):
+                        for alt in message.channel.alternatives:
+                            if hasattr(alt, 'transcript'):
+                                transcript_text = getattr(alt, 'transcript', None)
+                                break
+                    elif hasattr(message, 'transcript'):
+                        transcript_text = message.transcript
+                    elif isinstance(message, str):
+                        transcript_text = message
+                    elif isinstance(message, dict):
+                        if message.get('is_final', True):
+                            transcript_text = message.get('transcript') or message.get('text')
+                    
+                    if transcript_text and transcript_text.strip():
+                        text = transcript_text.strip()
+                        with self._lock:
+                            old_length = len(self.final_transcript) if self.final_transcript else 0
+                            new_length = len(text)
+                            
+                            # For streaming, send ALL updates (like faster-whisper yields segments incrementally)
+                            # Only filter out if new transcript is much shorter (likely a fragment)
+                            should_send = False
+                            
+                            if old_length == 0:
+                                # First transcript - always send
+                                should_send = True
+                                self.final_transcript = text
+                            elif new_length > old_length:
+                                # Longer transcript - refinement, always send
+                                should_send = True
+                                self.final_transcript = text
+                            elif new_length >= old_length * 0.8:
+                                # Similar length - might be correction, send if different
+                                if text != self.final_transcript:
+                                    should_send = True
+                                    self.final_transcript = text
+                            else:
+                                # Much shorter - likely fragment, ignore
+                                logger.debug(f"Ignoring shorter fragment: {new_length} chars (current: {old_length} chars)")
+                            
+                            # Send progressive update if it's new (like faster-whisper yields segments)
+                            if should_send and text != self.last_sent_transcript:
+                                self.last_sent_transcript = text
+                                try:
+                                    # Send immediately (progressive updates like faster-whisper)
+                                    asyncio.run_coroutine_threadsafe(
+                                        self.transcript_callback(text), 
+                                        self.event_loop
+                                    )
+                                    logger.debug(f"📤 Sent progressive transcript update: {text[:50]}...")
+                                except Exception as e:
+                                    logger.error(f"Error calling transcript callback: {e}", exc_info=True)
+                except Exception as e:
+                    logger.error(f"Error in streaming message handler: {e}", exc_info=True)
+            
+            def on_close():
+                logger.debug("Streaming connection closed")
+            
+            def on_error(error):
+                error_code = getattr(error, 'code', None)
+                error_desc = getattr(error, 'description', None)
+                logger.error(f"Streaming connection error: code={error_code}, description={error_desc}, error={error}")
+            
+            try:
+                # Use context manager properly (like faster-whisper uses context managers)
+                # Connect to v2/listen endpoint for streaming (same pattern as _transcribe_flux_streaming)
+                self.connection_context = self.dg_client.listen.v2.connect(
+                    model=self.model,
+                    encoding="linear16",
+                    sample_rate="16000"  # Default sample rate
+                )
+                self.connection = self.connection_context.__enter__()
+                
+                logger.info("Connected to Deepgram streaming API")
+                
+                # Set up event handlers
+                try:
+                    from deepgram.core.events import EventType
+                    self.connection.on(EventType.OPEN, lambda _: logger.debug("Streaming connection opened"))
+                    self.connection.on(EventType.MESSAGE, on_message)
+                    self.connection.on(EventType.CLOSE, on_close)
+                    self.connection.on(EventType.ERROR, on_error)
+                    if hasattr(EventType, 'END_OF_TURN'):
+                        self.connection.on(EventType.END_OF_TURN, lambda _: logger.debug("EndOfTurn received"))
+                except (ImportError, AttributeError) as e:
+                    logger.debug(f"Using EventType failed: {e}, trying fallback")
+                    # Fallback to string-based event names
+                    self.connection.on("open", lambda _: logger.debug("Streaming connection opened"))
+                    self.connection.on("message", on_message)
+                    self.connection.on("close", on_close)
+                    self.connection.on("error", on_error)
+                    self.connection.on("end_of_turn", lambda _: logger.debug("EndOfTurn received"))
+                
+                # Start listening for messages (per Deepgram docs, call before sending)
+                self.listening_thread = threading.Thread(target=self.connection.start_listening, daemon=True)
+                self.listening_thread.start()
+                time.sleep(0.1)  # Give it a moment to start
+                
+                logger.info("✅ Streaming connection established and listening")
+            except Exception as e:
+                logger.error(f"Error starting streaming connection: {e}", exc_info=True)
+                raise
+        
+        # Run in executor since Deepgram SDK is sync
+        await loop.run_in_executor(None, run_streaming)
+    
+    def send_media(self, chunk: bytes):
+        """Send audio chunk to the streaming connection (like faster-whisper processes chunks incrementally)"""
+        if self.connection:
+            try:
+                # Send chunk immediately (incremental processing like faster-whisper)
+                self.connection.send_media(chunk)
+            except Exception as e:
+                logger.error(f"Error sending chunk to streaming connection: {e}", exc_info=True)
+    
+    def close(self):
+        """Close the streaming connection"""
+        if self.connection_context and self.connection:
+            try:
+                self.connection_context.__exit__(None, None, None)
+            except Exception as e:
+                logger.error(f"Error closing streaming connection: {e}")
+            finally:
+                self.connection = None
+                self.connection_context = None
 
     async def transcribe(self, audio_data: bytes, sample_rate: int):
         """
@@ -468,6 +655,8 @@ class EventHandler(AsyncEventHandler):
         self.stt = DeepgramSTT(model=model)
         self.audio_data = b""
         self.sample_rate = 16000  # Default sample rate; can be adjusted
+        self.streaming_connection = None  # For streaming mode
+        self.streaming_active = False
         wyoming_info = self.WYOMING_INFO
         self.wyoming_info_event = wyoming_info.event()
 
@@ -476,18 +665,87 @@ class EventHandler(AsyncEventHandler):
         if event.type == "describe":
             logger.info("📤 Responding to describe event.")
             await self.write_event(self.wyoming_info_event)
+        elif event.type == "audio-start":
+            logger.info(f"Received Wyoming event: {event.type} - Data: {event.data}")
+            # Extract sample rate from audio-start event
+            if event.data:
+                self.sample_rate = event.data.get("rate", 16000)
+                logger.info(f"Audio stream started, sample rate: {self.sample_rate}")
+            
+            # For Flux models, start streaming connection
+            if self.stt.is_flux:
+                try:
+                    # Define callback to send progressive transcripts
+                    async def send_transcript(text: str):
+                        result_event = Event(type="transcript", data={"text": text})
+                        await self.write_event(result_event)
+                        logger.debug(f"📤 Sent streaming transcript: {text[:50]}...")
+                    
+                    self.streaming_connection = await self.stt.start_streaming(
+                        self.sample_rate, 
+                        send_transcript
+                    )
+                    self.streaming_active = True
+                    logger.info("✅ Started streaming transcription")
+                except Exception as e:
+                    logger.error(f"Failed to start streaming: {e}", exc_info=True)
+                    self.streaming_active = False
+            else:
+                # For non-Flux models, use batch mode
+                self.streaming_active = False
+                self.audio_data = b""
         elif event.type == "audio-chunk":
-            self.audio_data += event.payload
+            if self.streaming_active and self.streaming_connection:
+                # Streaming mode: send chunk immediately to Deepgram
+                try:
+                    # Send audio chunk to streaming connection (in executor since it's sync)
+                    loop = asyncio.get_event_loop()
+                    chunk = event.payload
+                    
+                    # Flux requires 80ms chunks, but we'll send as received and let Deepgram handle it
+                    # Send chunk directly (StreamingSession handles thread safety)
+                    self.streaming_connection.send_media(chunk)
+                except Exception as e:
+                    logger.error(f"Error processing streaming audio chunk: {e}", exc_info=True)
+            else:
+                # Batch mode: accumulate audio data
+                self.audio_data += event.payload
         elif event.type == "audio-stop":
             logger.info(f"Received Wyoming event: {event.type} - Data: {event.data}")
-            # Send to Deepgram and get transcription
-            text = await self.stt.transcribe(self.audio_data, self.sample_rate)
-            result_event = Event(type="transcript", data={"text": text})
             
-            logger.info(f"Sending Transcript Event: {text}")
-            
-            await self.write_event(result_event)
-            self.audio_data = b""  # Reset for next transcription
+            if self.streaming_active and self.streaming_connection:
+                # Streaming mode: finalize the stream
+                try:
+                    # Close the streaming connection (in executor since it's sync)
+                    loop = asyncio.get_event_loop()
+                    
+                    # Send final chunk if any remaining audio
+                    if self.audio_data:
+                        self.streaming_connection.send_media(self.audio_data)
+                    
+                    # Close the connection
+                    loop = asyncio.get_event_loop()
+                    def close_stream():
+                        try:
+                            self.streaming_connection.close()
+                        except Exception as e:
+                            logger.error(f"Error closing streaming connection: {e}")
+                    
+                    await loop.run_in_executor(None, close_stream)
+                    self.streaming_connection = None
+                    self.streaming_active = False
+                    logger.info("✅ Streaming transcription finalized")
+                except Exception as e:
+                    logger.error(f"Error finalizing streaming: {e}", exc_info=True)
+            else:
+                # Batch mode: process accumulated audio
+                text = await self.stt.transcribe(self.audio_data, self.sample_rate)
+                result_event = Event(type="transcript", data={"text": text})
+                
+                logger.info(f"Sending Transcript Event: {text}")
+                
+                await self.write_event(result_event)
+                self.audio_data = b""  # Reset for next transcription
         else:
             logger.info(f"Received Wyoming event: {event.type} - Data: {event.data}")
 
