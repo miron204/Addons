@@ -43,6 +43,420 @@ class DeepgramSTT:
         session = StreamingSession(self.dg_client, self.model, transcript_callback, loop)
         await session.start()
         return session
+    
+    async def transcribe(self, audio_data: bytes, sample_rate: int):
+        """
+        Send audio data to Deepgram and return transcription.
+        Try prerecorded API first (faster), fallback to streaming for Flux if needed.
+        """
+        if self.is_flux:
+            # Try prerecorded API first for speed (like nova-3)
+            try:
+                return await self._transcribe_prerecorded(audio_data, sample_rate)
+            except Exception as e:
+                logger.warning(f"Prerecorded API failed for Flux: {e}, falling back to streaming")
+                return await self._transcribe_flux_streaming(audio_data, sample_rate)
+        else:
+            return await self._transcribe_prerecorded(audio_data, sample_rate)
+    
+    async def _transcribe_prerecorded(self, audio_data: bytes, sample_rate: int):
+        """Use prerecorded API for non-Flux models."""
+        # SDK 5.x uses media.transcribe_file with request as bytes
+        # This is a synchronous method, so run it in executor
+        loop = asyncio.get_event_loop()
+        
+        def transcribe_sync():
+            # Check if audio_data is WAV (has RIFF header) or raw PCM
+            is_wav = audio_data[:4] == b'RIFF'
+            
+            # Try different API paths for Deepgram SDK 5.x
+            # The SDK structure may vary between versions
+            api_path = None
+            
+            # First, log what's available for debugging
+            listen_obj = getattr(self.dg_client, 'listen', None)
+            if listen_obj:
+                listen_attrs = [attr for attr in dir(listen_obj) if not attr.startswith('_')]
+                logger.debug(f"ListenRouter attributes: {listen_attrs}")
+            
+            # Try different API paths - try rest.v1 first (more likely in SDK 5.x)
+            try:
+                # Path 1: dg_client.rest.v1.listen.media.transcribe_file (most likely in SDK 5.x)
+                if hasattr(self.dg_client, 'rest'):
+                    rest_obj = self.dg_client.rest
+                    if hasattr(rest_obj, 'v1'):
+                        v1_obj = rest_obj.v1
+                        if hasattr(v1_obj, 'listen') and hasattr(v1_obj.listen, 'media'):
+                            api_path = v1_obj.listen.media.transcribe_file
+                            logger.debug("Using API path: rest.v1.listen.media.transcribe_file")
+            except AttributeError as e:
+                logger.debug(f"Path 1 (rest.v1) failed: {e}")
+            
+            if not api_path:
+                try:
+                    # Path 2: dg_client.listen.v1.media.transcribe_file (if v1 exists on listen)
+                    if listen_obj and hasattr(listen_obj, 'v1'):
+                        api_path = listen_obj.v1.media.transcribe_file
+                        logger.debug("Using API path: listen.v1.media.transcribe_file")
+                except AttributeError as e:
+                    logger.debug(f"Path 2 (listen.v1) failed: {e}")
+            
+            if not api_path:
+                try:
+                    # Path 3: Use REST client directly (alternative SDK structure)
+                    if hasattr(self.dg_client, 'rest'):
+                        # Some SDK versions use rest.transcription.sync_prerecorded
+                        if hasattr(self.dg_client.rest, 'transcription'):
+                            # Try to find transcribe method
+                            trans_obj = self.dg_client.rest.transcription
+                            if hasattr(trans_obj, 'transcribe_file'):
+                                api_path = trans_obj.transcribe_file
+                                logger.debug("Using API path: rest.transcription.transcribe_file")
+                except AttributeError as e:
+                    logger.debug(f"Path 3 failed: {e}")
+            
+            if not api_path:
+                # Log all available attributes for debugging
+                dg_attrs = [attr for attr in dir(self.dg_client) if not attr.startswith('_')]
+                logger.error(f"Available dg_client attributes: {dg_attrs}")
+                if listen_obj:
+                    logger.error(f"Available listen attributes: {[attr for attr in dir(listen_obj) if not attr.startswith('_')]}")
+                raise AttributeError("Could not find Deepgram v1 API path. Please check SDK version and update code.")
+            
+            if is_wav:
+                # WAV file - SDK auto-detects format
+                response = api_path(
+                    request=audio_data,
+                    model=self.model,
+                    smart_format=True,
+                    language='en-US',
+                    punctuate=True,
+                )
+            else:
+                # Raw PCM from Wyoming - create WAV header
+                # Wyoming sends raw PCM audio, so we need to wrap it in WAV format
+                wav_header = struct.pack('<4sI4s4sIHHIIHH4sI',
+                    b'RIFF',
+                    36 + len(audio_data),  # File size - 8
+                    b'WAVE',
+                    b'fmt ',
+                    16,  # fmt chunk size
+                    1,   # Audio format (PCM)
+                    1,   # Number of channels (mono)
+                    sample_rate,
+                    sample_rate * 2,  # Byte rate
+                    2,   # Block align
+                    16,  # Bits per sample
+                    b'data',
+                    len(audio_data)  # Data chunk size
+                )
+                wav_data = wav_header + audio_data
+                
+                response = api_path(
+                    request=wav_data,
+                    model=self.model,
+                    smart_format=True,
+                    language='en-US',
+                    punctuate=True,
+                )
+            return response
+        
+        try:
+            response = await loop.run_in_executor(None, transcribe_sync)
+            
+            # SDK 5.x response structure - check the actual type
+            if hasattr(response, 'results'):
+                # Response object with .results attribute
+                channels = response.results.channels
+                if channels and len(channels) > 0:
+                    alternatives = channels[0].alternatives
+                    if alternatives and len(alternatives) > 0:
+                        transcript = alternatives[0].transcript
+                        return transcript
+            
+            # Fallback: try dict access
+            if isinstance(response, dict):
+                transcript = response.get("results", {}).get("channels", [{}])[0].get("alternatives", [{}])[0].get("transcript", "")
+                return transcript
+            
+            logger.warning("Unexpected response format from Deepgram API")
+            return ""
+        except Exception as e:
+            logger.error(f"Error in prerecorded transcription: {e}", exc_info=True)
+            raise
+    
+    async def _transcribe_flux_streaming(self, audio_data: bytes, sample_rate: int):
+        """Use streaming API for Flux models (v2/listen endpoint)."""
+        logger.info(f"Using Flux streaming API (v2/listen) with model: {self.model}")
+        
+        try:
+            # Connect to v2/listen endpoint for Flux using SDK 5.x v2 API
+            # Note: v2.connect() returns a sync context manager, so we use regular 'with'
+            # but run the blocking operations in an executor
+            loop = asyncio.get_event_loop()
+            
+            def run_flux_transcription():
+                """Run the sync Flux transcription in a thread"""
+                final_transcript = ""
+                transcript_received = threading.Event()
+                # Track last time we updated transcript to implement a short debounce
+                import time
+                last_update_time = time.monotonic()
+                
+                # Define message handler - accumulate all FINAL transcript segments
+                def on_message(message):
+                    nonlocal final_transcript, last_update_time
+                    try:
+                        # Check message type (per official docs)
+                        msg_type_name = type(message).__name__
+                        msg_type_attr = getattr(message, 'type', None)
+                        logger.info(f"📨 Message received: class={msg_type_name}, type={msg_type_attr}")
+                        
+                        # Filter out connection and error events (these are handled separately)
+                        if 'Connected' in msg_type_name or 'Error' in msg_type_name or 'Fatal' in msg_type_name:
+                            if 'Error' in msg_type_name or 'Fatal' in msg_type_name:
+                                # Log error details
+                                error_code = getattr(message, 'code', None)
+                                error_desc = getattr(message, 'description', None)
+                                logger.error(f"❌ Deepgram error: code={error_code}, description={error_desc}")
+                            return
+                        
+                        # Check if this is a final result (not interim)
+                        is_final = getattr(message, 'is_final', None)
+                        
+                        # For Flux, we only want final transcripts, not interim ones
+                        if is_final is False:
+                            logger.debug("Ignoring interim transcript")
+                            return
+                        
+                        # Try different message formats for transcript
+                        transcript_text = None
+                        
+                        logger.debug(f"  Message attributes: {[attr for attr in dir(message) if not attr.startswith('_') and not callable(getattr(message, attr, None))]}")
+                        
+                        # Check for channel.alternatives pattern (most common for v2 API)
+                        if hasattr(message, 'channel'):
+                            channel = message.channel
+                            logger.debug(f"  Found channel: {channel}")
+                            if hasattr(channel, 'alternatives') and len(channel.alternatives) > 0:
+                                alt = channel.alternatives[0]
+                                logger.debug(f"  Alternative: {alt}")
+                                transcript_text = getattr(alt, 'transcript', None)
+                                logger.info(f"✅ Found transcript in channel.alternatives: {transcript_text}")
+                        
+                        # Check for direct transcript attribute
+                        elif hasattr(message, 'transcript'):
+                            transcript_text = message.transcript
+                            logger.info(f"✅ Found transcript in message.transcript: {transcript_text}")
+                        
+                        # Check if message itself is a string or dict
+                        elif isinstance(message, str):
+                            transcript_text = message
+                            logger.info(f"✅ Message is string: {transcript_text}")
+                        elif isinstance(message, dict):
+                            # Only use final results from dict
+                            if message.get('is_final', True):
+                                transcript_text = message.get('transcript') or message.get('text')
+                                logger.info(f"✅ Message is dict (final): {transcript_text}")
+                        
+                        # For Flux, each final message is a REPLACEMENT/refinement of the previous transcript
+                        # Flux sends progressive updates: "Hello" -> "Hello there" -> "Hello there. I'm Bob" etc.
+                        # These are NOT segments to append - they are refinements that replace the previous one
+                        if transcript_text and transcript_text.strip():
+                            text = transcript_text.strip()
+                            
+                            # Only update if the new transcript is longer or significantly different
+                            # This prevents replacing a longer, more complete transcript with a shorter fragment
+                            old_length = len(final_transcript) if final_transcript else 0
+                            new_length = len(text)
+                            
+                            # Update if:
+                            # 1. We don't have a transcript yet (old_length == 0)
+                            # 2. The new transcript is longer (refinement)
+                            # 3. The new transcript is at least 80% of the old length (might be a correction)
+                            should_update = (old_length == 0 or 
+                                           new_length > old_length or 
+                                           (new_length >= old_length * 0.8 and text != final_transcript))
+                            
+                            if should_update:
+                                # Only update if new transcript is at least 80% of old length
+                                # This prevents replacing a longer transcript with a short fragment
+                                if old_length == 0 or new_length >= old_length * 0.8:
+                                    final_transcript = text
+                                    last_update_time = time.monotonic()
+                                    
+                                    if new_length > old_length:
+                                        logger.info(f"✅ Transcript refined: {old_length} → {new_length} chars: {text[:100]}{'...' if len(text) > 100 else ''}")
+                                    else:
+                                        logger.debug(f"Transcript updated: {new_length} chars")
+                                else:
+                                    # New transcript is much shorter - ignore it, keep the longer one
+                                    logger.debug(f"Ignoring shorter fragment: {new_length} chars (keeping {old_length} chars): {text[:50]}...")
+                            
+                            # Don't set the event yet - wait for EndOfTurn or stream close
+                        else:
+                            logger.debug(f"No transcript found in message")
+                    except Exception as e:
+                        logger.error(f"Error in message handler: {e}", exc_info=True)
+                
+                with self.dg_client.listen.v2.connect(
+                    model=self.model,
+                    encoding="linear16",
+                    sample_rate=str(sample_rate),  # Deepgram expects string
+                ) as connection:
+                    logger.info("Connected to Deepgram Flux streaming API")
+                    
+                    # Set up event handlers using official EventType from documentation
+                    def on_close(_):
+                        # When connection closes, we have the final transcript
+                        logger.debug("Connection closed, using final transcript")
+                        transcript_received.set()
+                    
+                    def on_error(error):
+                        error_code = getattr(error, 'code', None)
+                        error_desc = getattr(error, 'description', None)
+                        logger.error(f"Flux connection error: code={error_code}, description={error_desc}, error={error}")
+                        transcript_received.set()
+                    
+                    # Use EventType from deepgram.core.events as per official docs
+                    try:
+                        from deepgram.core.events import EventType
+                        connection.on(EventType.OPEN, lambda _: logger.debug("Flux connection opened"))
+                        connection.on(EventType.MESSAGE, on_message)
+                        connection.on(EventType.CLOSE, on_close)
+                        connection.on(EventType.ERROR, on_error)
+                        # Check for EndOfTurn if available
+                        if hasattr(EventType, 'END_OF_TURN'):
+                            connection.on(EventType.END_OF_TURN, lambda _: (logger.debug("EndOfTurn received"), transcript_received.set()))
+                    except (ImportError, AttributeError) as e:
+                        logger.debug(f"Using EventType failed: {e}, trying fallback")
+                        # Fallback to string-based event names
+                        connection.on("open", lambda _: logger.debug("Flux connection opened"))
+                        connection.on("message", on_message)
+                        connection.on("close", on_close)
+                        connection.on("error", on_error)
+                        connection.on("end_of_turn", lambda _: (logger.debug("EndOfTurn received"), transcript_received.set()))
+                    
+                    # Start listening for messages (per official docs, call before sending)
+                    listening_thread = threading.Thread(target=connection.start_listening, daemon=True)
+                    listening_thread.start()
+                    # Give it a moment to start
+                    time.sleep(0.1)
+                    
+                    # For streaming API, we need raw PCM (not WAV with header)
+                    # Check if audio_data is WAV (has RIFF header) or raw PCM
+                    is_wav = audio_data[:4] == b'RIFF'
+                    if is_wav:
+                        # Strip WAV header - find 'data' chunk and extract PCM data
+                        data_chunk_pos = audio_data.find(b'data', 12)
+                        if data_chunk_pos != -1:
+                            # Skip 'data' marker (4 bytes) and size (4 bytes)
+                            pcm_data = audio_data[data_chunk_pos + 8:]
+                            logger.debug(f"Stripped WAV header, extracted {len(pcm_data)} bytes of raw PCM")
+                        else:
+                            # Fallback: assume data starts after header (usually at byte 44 for standard WAV)
+                            pcm_data = audio_data[44:]
+                            logger.debug(f"Using fallback WAV header skip, extracted {len(pcm_data)} bytes of raw PCM")
+                    else:
+                        # Already raw PCM
+                        pcm_data = audio_data
+                        logger.debug(f"Audio is already raw PCM: {len(pcm_data)} bytes")
+                    
+                    # Flux API REQUIRES 80ms chunks (per error message)
+                    # Calculate chunk size: 80ms at sample_rate, 16-bit (2 bytes per sample)
+                    chunk_size_bytes = int(sample_rate * 0.08 * 2)  # 80ms chunks
+                    bytes_sent = 0
+                    chunk_count = 0
+                    
+                    logger.info(f"Sending {len(pcm_data)} bytes of PCM audio in {len(pcm_data) // chunk_size_bytes + 1} chunks (80ms each)...")
+                    for i in range(0, len(pcm_data), chunk_size_bytes):
+                        chunk = pcm_data[i:i + chunk_size_bytes]
+                        if chunk:
+                            connection.send_media(chunk)
+                            bytes_sent += len(chunk)
+                            chunk_count += 1
+                            logger.debug(f"Sent chunk {chunk_count}: {len(chunk)} bytes")
+                    
+                    
+                    logger.info(f"Finished sending {chunk_count} chunks, total {bytes_sent} bytes")
+                    logger.info(f"Finished sending audio data, waiting for transcript...")
+                    
+                    # Wait for first message to arrive (with timeout)
+                    # Reduced for prerecorded files since all audio is sent at once
+                    initial_wait = 2.0  # Reduced from 3.0s for faster response
+                    first_message_timeout = time.monotonic() + initial_wait
+                    logger.info(f"Waiting up to {initial_wait}s for first transcript message...")
+                    
+                    while not final_transcript and time.monotonic() < first_message_timeout:
+                        if transcript_received.is_set():
+                            break
+                        time.sleep(0.1)
+                    
+                    if not final_transcript:
+                        logger.warning("No transcript messages received after initial wait")
+                    else:
+                        logger.info(f"First transcript received ({len(final_transcript)} chars): {final_transcript[:100]}...")
+                    
+                    # After receiving at least one message, debounce for final refinements
+                    # For prerecorded files (all audio sent at once), use shorter debounce
+                    # For real-time streaming, Flux continues refining longer
+                    # Since we're sending all audio at once, use shorter debounce for faster response
+                    # But keep max_total_wait high enough to allow complete processing of long audio files
+                    debounce_seconds = 1.5  # Reduced to 1.5s for prerecorded files (was 4.0s)
+                    max_total_wait = 60.0  # Increased to 60s to allow complete processing (was 15.0s, too short)
+                    start_wait = time.monotonic()
+                    last_logged_length = 0
+                    logger.info("Waiting for EndOfTurn or transcript stabilization...")
+                    
+                    while True:
+                        # Prioritize EndOfTurn event - this means Flux is done
+                        if transcript_received.is_set():
+                            logger.info("EndOfTurn/Close received; returning complete transcript")
+                            break
+                        
+                        now = time.monotonic()
+                        elapsed = now - start_wait
+                        time_since_update = now - last_update_time if final_transcript else 999
+                        
+                        # Log when transcript length increases (but not every loop)
+                        if final_transcript and len(final_transcript) > last_logged_length:
+                            logger.info(f"Transcript updated: {len(final_transcript)} chars (update {time_since_update:.2f}s ago, total wait {elapsed:.1f}s)")
+                            last_logged_length = len(final_transcript)
+                        
+                        # If we have a transcript, wait for debounce period of no updates
+                        # This means Flux has stopped sending refinements
+                        # Prioritize debounce check - if no updates for debounce period, return immediately
+                        if final_transcript and time_since_update >= debounce_seconds:
+                            logger.info(f"No updates for {debounce_seconds}s; transcript appears complete ({len(final_transcript)} chars)")
+                            break
+                        
+                        # Safety timeout - only as a last resort if debounce never triggers
+                        # This should rarely be hit if Flux is working properly
+                        if elapsed >= max_total_wait:
+                            logger.warning(f"Max wait time ({max_total_wait}s) reached; returning transcript ({len(final_transcript)} chars)")
+                            break
+                        
+                        time.sleep(0.1)
+                    
+                    if final_transcript:
+                        logger.info(f"Returning complete transcript ({len(final_transcript)} chars)")
+                        return final_transcript.strip()
+                    else:
+                        logger.warning("No transcript received after waiting")
+                        return ""
+            
+            # Run the sync transcription in a thread
+            result = await loop.run_in_executor(None, run_flux_transcription)
+            
+            if result:
+                logger.info(f"Flux transcription complete: {result}")
+                return result
+            else:
+                logger.warning("No transcript received from Flux API")
+                return ""
+        except Exception as e:
+            logger.error(f"Error in Flux streaming transcription: {e}", exc_info=True)
+            raise
 
 
 class StreamingSession:
@@ -215,429 +629,6 @@ class StreamingSession:
                 self.connection = None
                 self.connection_context = None
 
-    async def transcribe(self, audio_data: bytes, sample_rate: int):
-        """
-        Send audio data to Deepgram and return transcription.
-        Try prerecorded API first (faster), fallback to streaming for Flux if needed.
-        """
-        if self.is_flux:
-            # Try prerecorded API first for speed (like nova-3)
-            try:
-                return await self._transcribe_prerecorded(audio_data, sample_rate)
-            except Exception as e:
-                logger.warning(f"Prerecorded API failed for Flux: {e}, falling back to streaming")
-                return await self._transcribe_flux_streaming(audio_data, sample_rate)
-        else:
-            return await self._transcribe_prerecorded(audio_data, sample_rate)
-    
-    async def _transcribe_prerecorded(self, audio_data: bytes, sample_rate: int):
-        """Use prerecorded API for non-Flux models."""
-        # SDK 5.x uses media.transcribe_file with request as bytes
-        # This is a synchronous method, so run it in executor
-        loop = asyncio.get_event_loop()
-        
-        def transcribe_sync():
-            # Check if audio_data is WAV (has RIFF header) or raw PCM
-            is_wav = audio_data[:4] == b'RIFF'
-            
-            # Try different API paths for Deepgram SDK 5.x
-            # The SDK structure may vary between versions
-            api_path = None
-            
-            # First, log what's available for debugging
-            listen_obj = getattr(self.dg_client, 'listen', None)
-            if listen_obj:
-                listen_attrs = [attr for attr in dir(listen_obj) if not attr.startswith('_')]
-                logger.debug(f"ListenRouter attributes: {listen_attrs}")
-            
-            # Try different API paths - try rest.v1 first (more likely in SDK 5.x)
-            try:
-                # Path 1: dg_client.rest.v1.listen.media.transcribe_file (most likely in SDK 5.x)
-                if hasattr(self.dg_client, 'rest'):
-                    rest_obj = self.dg_client.rest
-                    if hasattr(rest_obj, 'v1'):
-                        v1_obj = rest_obj.v1
-                        if hasattr(v1_obj, 'listen') and hasattr(v1_obj.listen, 'media'):
-                            api_path = v1_obj.listen.media.transcribe_file
-                            logger.debug("Using API path: rest.v1.listen.media.transcribe_file")
-            except AttributeError as e:
-                logger.debug(f"Path 1 (rest.v1) failed: {e}")
-            
-            if not api_path:
-                try:
-                    # Path 2: dg_client.listen.v1.media.transcribe_file (if v1 exists on listen)
-                    if listen_obj and hasattr(listen_obj, 'v1'):
-                        api_path = listen_obj.v1.media.transcribe_file
-                        logger.debug("Using API path: listen.v1.media.transcribe_file")
-                except AttributeError as e:
-                    logger.debug(f"Path 2 (listen.v1) failed: {e}")
-            
-            if not api_path:
-                try:
-                    # Path 3: Use REST client directly (alternative SDK structure)
-                    if hasattr(self.dg_client, 'rest'):
-                        # Some SDK versions use rest.transcription.sync_prerecorded
-                        if hasattr(self.dg_client.rest, 'transcription'):
-                            # Try to find transcribe method
-                            trans_obj = self.dg_client.rest.transcription
-                            if hasattr(trans_obj, 'transcribe_file'):
-                                api_path = trans_obj.transcribe_file
-                                logger.debug("Using API path: rest.transcription.transcribe_file")
-                except AttributeError:
-                    pass
-            
-            if not api_path:
-                # Log all available attributes for debugging
-                dg_attrs = [attr for attr in dir(self.dg_client) if not attr.startswith('_')]
-                logger.error(f"Available dg_client attributes: {dg_attrs}")
-                if listen_obj:
-                    logger.error(f"Available listen attributes: {[attr for attr in dir(listen_obj) if not attr.startswith('_')]}")
-                raise AttributeError("Could not find Deepgram v1 API path. Please check SDK version and update code.")
-            
-            if is_wav:
-                # WAV file - SDK auto-detects format
-                response = api_path(
-                    request=audio_data,
-                    model=self.model,
-                    smart_format=True,
-                    language='en-US',
-                    punctuate=True,
-                )
-            else:
-                # Raw PCM from Wyoming - create WAV header
-                # Wyoming sends raw PCM audio, so we need to wrap it in WAV format
-                wav_header = struct.pack('<4sI4s4sIHHIIHH4sI',
-                    b'RIFF',
-                    36 + len(audio_data),  # File size - 8
-                    b'WAVE',
-                    b'fmt ',
-                    16,  # fmt chunk size
-                    1,   # Audio format (PCM)
-                    1,   # Number of channels (mono)
-                    sample_rate,
-                    sample_rate * 2,  # Byte rate
-                    2,   # Block align
-                    16,  # Bits per sample
-                    b'data',
-                    len(audio_data)  # Data chunk size
-                )
-                wav_data = wav_header + audio_data
-                
-                response = api_path(
-                    request=wav_data,
-                    model=self.model,
-                    smart_format=True,
-                    language='en-US',
-                    punctuate=True,
-                )
-            return response
-        
-        try:
-            response = await loop.run_in_executor(None, transcribe_sync)
-            
-            # SDK 5.x response structure - check the actual type
-            if hasattr(response, 'results'):
-                # Response object with .results attribute
-                channels = response.results.channels
-                if channels and len(channels) > 0:
-                    alternatives = channels[0].alternatives
-                    if alternatives and len(alternatives) > 0:
-                        transcript = alternatives[0].transcript
-                        return transcript
-            elif isinstance(response, dict):
-                # Dictionary response
-                transcript = response.get("results", {}).get("channels", [{}])[0].get("alternatives", [{}])[0].get("transcript", "")
-                return transcript
-            
-            logger.error(f"Unexpected response format: {type(response)}")
-            return ""
-        except Exception as e:
-            logger.error(f"Error in prerecorded transcription: {e}", exc_info=True)
-            raise
-    
-    async def _transcribe_flux_streaming(self, audio_data: bytes, sample_rate: int):
-        """Use streaming API for Flux models (v2/listen endpoint)."""
-        logger.info(f"Using Flux streaming API (v2/listen) with model: {self.model}")
-        
-        try:
-            # Connect to v2/listen endpoint for Flux using SDK 5.x v2 API
-            # Note: v2.connect() returns a sync context manager, so we use regular 'with'
-            # but run the blocking operations in an executor
-            loop = asyncio.get_event_loop()
-            
-            def run_flux_transcription():
-                """Run the sync Flux transcription in a thread"""
-                final_transcript = ""
-                transcript_received = threading.Event()
-                # Track last time we updated transcript to implement a short debounce
-                import time
-                last_update_time = time.monotonic()
-                
-                # Define message handler - accumulate all FINAL transcript segments
-                def on_message(message):
-                    nonlocal final_transcript, last_update_time
-                    try:
-                        # Check message type (per official docs)
-                        msg_type_name = type(message).__name__
-                        msg_type_attr = getattr(message, 'type', None)
-                        logger.info(f"📨 Message received: class={msg_type_name}, type={msg_type_attr}")
-                        
-                        # Filter out connection and error events (these are handled separately)
-                        if 'Connected' in msg_type_name or 'Error' in msg_type_name or 'Fatal' in msg_type_name:
-                            if 'Error' in msg_type_name or 'Fatal' in msg_type_name:
-                                # Log error details
-                                error_code = getattr(message, 'code', None)
-                                error_desc = getattr(message, 'description', None)
-                                logger.error(f"❌ Deepgram error: code={error_code}, description={error_desc}")
-                            return
-                        
-                        # Check if this is a final result (not interim)
-                        is_final = getattr(message, 'is_final', None)
-                        
-                        # For Flux, we only want final transcripts, not interim ones
-                        if is_final is False:
-                            logger.debug("Ignoring interim transcript")
-                            return
-                        
-                        # Try different message formats for transcript
-                        transcript_text = None
-                        
-                        logger.debug(f"  Message attributes: {[attr for attr in dir(message) if not attr.startswith('_') and not callable(getattr(message, attr, None))]}")
-                        
-                        # Check for channel.alternatives pattern (most common for v2 API)
-                        if hasattr(message, 'channel'):
-                            channel = message.channel
-                            logger.debug(f"  Found channel: {channel}")
-                            if hasattr(channel, 'alternatives') and len(channel.alternatives) > 0:
-                                alt = channel.alternatives[0]
-                                logger.debug(f"  Alternative: {alt}")
-                                transcript_text = getattr(alt, 'transcript', None)
-                                logger.info(f"✅ Found transcript in channel.alternatives: {transcript_text}")
-                        
-                        # Check for direct transcript attribute
-                        elif hasattr(message, 'transcript'):
-                            transcript_text = message.transcript
-                            logger.info(f"✅ Found transcript in message.transcript: {transcript_text}")
-                        
-                        # Check if message itself is a string or dict
-                        elif isinstance(message, str):
-                            transcript_text = message
-                            logger.info(f"✅ Message is string: {transcript_text}")
-                        elif isinstance(message, dict):
-                            # Only use final results from dict
-                            if message.get('is_final', True):
-                                transcript_text = message.get('transcript') or message.get('text')
-                                logger.info(f"✅ Message is dict (final): {transcript_text}")
-                        
-                        # For Flux, each final message is a REPLACEMENT/refinement of the previous transcript
-                        # Flux sends progressive updates: "Hello" -> "Hello there" -> "Hello there. I'm Bob" etc.
-                        # These are NOT segments to append - they are refinements that replace the previous one
-                        if transcript_text and transcript_text.strip():
-                            text = transcript_text.strip()
-                            
-                            # Only update if the new transcript is longer or significantly different
-                            # This prevents replacing a longer, more complete transcript with a shorter fragment
-                            old_length = len(final_transcript) if final_transcript else 0
-                            new_length = len(text)
-                            
-                            # Update if:
-                            # 1. We don't have a transcript yet (old_length == 0)
-                            # 2. The new transcript is longer (refinement)
-                            # 3. The new transcript is at least 80% of the old length (might be a correction)
-                            should_update = (old_length == 0 or 
-                                           new_length > old_length or 
-                                           (new_length >= old_length * 0.8 and text != final_transcript))
-                            
-                            if should_update:
-                                # Only update if new transcript is at least 80% of old length
-                                # This prevents replacing a longer transcript with a short fragment
-                                if old_length == 0 or new_length >= old_length * 0.8:
-                                    final_transcript = text
-                                    last_update_time = time.monotonic()
-                                    
-                                    if new_length > old_length:
-                                        logger.info(f"✅ Transcript refined: {old_length} → {new_length} chars: {text[:100]}{'...' if len(text) > 100 else ''}")
-                                    else:
-                                        logger.debug(f"Transcript updated: {new_length} chars")
-                                else:
-                                    # New transcript is much shorter - ignore it, keep the longer one
-                                    logger.debug(f"Ignoring shorter fragment: {new_length} chars (keeping {old_length} chars): {text[:50]}...")
-                            else:
-                                # Ignore shorter transcript fragments
-                                logger.debug(f"Ignoring shorter transcript fragment: {new_length} chars (current: {old_length} chars)")
-                            
-                            # Don't set the event yet - wait for EndOfTurn or stream close
-                        else:
-                            logger.debug(f"No transcript found in message")
-                    except Exception as e:
-                        logger.error(f"Error in message handler: {e}", exc_info=True)
-                
-                with self.dg_client.listen.v2.connect(
-                    model=self.model,
-                    encoding="linear16",
-                    sample_rate=str(sample_rate),  # Deepgram expects string
-                ) as connection:
-                    logger.info("Connected to Deepgram Flux streaming API")
-                    
-                    # Set up event handlers using official EventType from documentation
-                    def on_close(_):
-                        # When connection closes, we have the final transcript
-                        logger.debug("Connection closed, using final transcript")
-                        transcript_received.set()
-                    
-                    def on_error(error):
-                        error_code = getattr(error, 'code', None)
-                        error_desc = getattr(error, 'description', None)
-                        logger.error(f"Flux connection error: code={error_code}, description={error_desc}, error={error}")
-                        transcript_received.set()
-                    
-                    # Use EventType from deepgram.core.events as per official docs
-                    try:
-                        from deepgram.core.events import EventType
-                        connection.on(EventType.OPEN, lambda _: logger.debug("Flux connection opened"))
-                        connection.on(EventType.MESSAGE, on_message)
-                        connection.on(EventType.CLOSE, on_close)
-                        connection.on(EventType.ERROR, on_error)
-                        # Check for EndOfTurn if available
-                        if hasattr(EventType, 'END_OF_TURN'):
-                            connection.on(EventType.END_OF_TURN, lambda _: (logger.debug("EndOfTurn received"), transcript_received.set()))
-                    except (ImportError, AttributeError) as e:
-                        logger.debug(f"Using EventType failed: {e}, trying fallback")
-                        # Fallback to string-based event names
-                        connection.on("open", lambda _: logger.debug("Flux connection opened"))
-                        connection.on("message", on_message)
-                        connection.on("close", on_close)
-                        connection.on("error", on_error)
-                        connection.on("end_of_turn", lambda _: (logger.debug("EndOfTurn received"), transcript_received.set()))
-                    
-                    # Start listening for messages (per official docs, call before sending)
-                    listening_thread = threading.Thread(target=connection.start_listening, daemon=True)
-                    listening_thread.start()
-                    # Give it a moment to start
-                    time.sleep(0.1)
-                    
-                    # For streaming API, we need raw PCM (not WAV with header)
-                    # Check if audio_data is WAV (has RIFF header) or raw PCM
-                    is_wav = audio_data[:4] == b'RIFF'
-                    if is_wav:
-                        # Strip WAV header - find 'data' chunk and extract PCM data
-                        data_chunk_pos = audio_data.find(b'data', 12)
-                        if data_chunk_pos != -1:
-                            # Skip 'data' marker (4 bytes) and size (4 bytes)
-                            pcm_data = audio_data[data_chunk_pos + 8:]
-                            logger.debug(f"Stripped WAV header, extracted {len(pcm_data)} bytes of raw PCM")
-                        else:
-                            # Fallback: assume data starts after header (usually at byte 44 for standard WAV)
-                            pcm_data = audio_data[44:]
-                            logger.debug(f"Using fallback WAV header skip, extracted {len(pcm_data)} bytes of raw PCM")
-                    else:
-                        # Already raw PCM
-                        pcm_data = audio_data
-                        logger.debug(f"Audio is already raw PCM: {len(pcm_data)} bytes")
-                    
-                    # Flux API REQUIRES 80ms chunks (per error message)
-                    # Calculate chunk size: 80ms at sample_rate, 16-bit (2 bytes per sample)
-                    chunk_size_bytes = int(sample_rate * 0.08 * 2)  # 80ms chunks
-                    bytes_sent = 0
-                    chunk_count = 0
-                    
-                    logger.info(f"Sending {len(pcm_data)} bytes of PCM audio in {len(pcm_data) // chunk_size_bytes + 1} chunks (80ms each)...")
-                    for i in range(0, len(pcm_data), chunk_size_bytes):
-                        chunk = pcm_data[i:i + chunk_size_bytes]
-                        if chunk:
-                            connection.send_media(chunk)
-                            bytes_sent += len(chunk)
-                            chunk_count += 1
-                            logger.debug(f"Sent chunk {chunk_count}: {len(chunk)} bytes")
-                    
-                    logger.info(f"Finished sending {chunk_count} chunks, total {bytes_sent} bytes")
-                    
-                    # Send close control to signal end of stream
-                    try:
-                        connection.send_control({"type": "CloseStream"})
-                    except Exception as e:
-                        logger.debug(f"Could not send CloseStream: {e}")
-                    
-                    logger.info(f"Finished sending audio data, waiting for transcript...")
-                    
-                    # Wait for first message to arrive (with timeout)
-                    # Reduced for prerecorded files since all audio is sent at once
-                    initial_wait = 2.0  # Reduced from 3.0s for faster response
-                    first_message_timeout = time.monotonic() + initial_wait
-                    logger.info(f"Waiting up to {initial_wait}s for first transcript message...")
-                    
-                    # Wait for at least one message
-                    while not final_transcript and time.monotonic() < first_message_timeout:
-                        if transcript_received.is_set():
-                            break
-                        time.sleep(0.1)
-                    
-                    if not final_transcript:
-                        logger.warning("No transcript messages received after initial wait")
-                    else:
-                        logger.info(f"First transcript received ({len(final_transcript)} chars): {final_transcript[:100]}...")
-                    
-                    # After receiving at least one message, debounce for final refinements
-                    # For prerecorded files (all audio sent at once), use shorter debounce
-                    # For real-time streaming, Flux continues refining longer
-                    # Since we're sending all audio at once, use shorter debounce for faster response
-                    # But keep max_total_wait high enough to allow complete processing of long audio files
-                    debounce_seconds = 1.5  # Reduced to 1.5s for prerecorded files (was 4.0s)
-                    max_total_wait = 60.0  # Increased to 60s to allow complete processing (was 15.0s, too short)
-                    start_wait = time.monotonic()
-                    last_logged_length = 0
-                    logger.info("Waiting for EndOfTurn or transcript stabilization...")
-                    
-                    while True:
-                        # Prioritize EndOfTurn event - this means Flux is done
-                        if transcript_received.is_set():
-                            logger.info("EndOfTurn/Close received; returning complete transcript")
-                            break
-                        
-                        now = time.monotonic()
-                        elapsed = now - start_wait
-                        time_since_update = now - last_update_time if final_transcript else 999
-                        
-                        # Log when transcript length increases (but not every loop)
-                        if final_transcript and len(final_transcript) > last_logged_length:
-                            logger.info(f"Transcript updated: {len(final_transcript)} chars (update {time_since_update:.2f}s ago, total wait {elapsed:.1f}s)")
-                            last_logged_length = len(final_transcript)
-                        
-                        # If we have a transcript, wait for debounce period of no updates
-                        # This means Flux has stopped sending refinements
-                        # Prioritize debounce check - if no updates for debounce period, return immediately
-                        if final_transcript and time_since_update >= debounce_seconds:
-                            logger.info(f"No updates for {debounce_seconds}s; transcript appears complete ({len(final_transcript)} chars)")
-                            break
-                        
-                        # Safety timeout - only as a last resort if debounce never triggers
-                        # This should rarely be hit if Flux is working properly
-                        if elapsed >= max_total_wait:
-                            logger.warning(f"Max wait time ({max_total_wait}s) reached; returning transcript ({len(final_transcript)} chars)")
-                            break
-                        
-                        time.sleep(0.1)
-
-                    if final_transcript:
-                        logger.info(f"Returning complete transcript ({len(final_transcript)} chars)")
-                        return final_transcript.strip()
-                    else:
-                        logger.warning("No transcript received after waiting")
-                        return ""
-            
-            # Run the sync transcription in a thread
-            result = await loop.run_in_executor(None, run_flux_transcription)
-            
-            if not result:
-                logger.warning("No transcript received from Flux API")
-                return ""
-            
-            logger.info(f"Flux transcription complete: {result}")
-            return result
-        except Exception as e:
-            logger.error(f"Error in Flux streaming transcription: {e}", exc_info=True)
-            # Flux doesn't support prerecorded API, so re-raise the error
-            raise
 
 class State:
     def __init__(self):
