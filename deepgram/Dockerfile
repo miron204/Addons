@@ -1,11 +1,12 @@
 FROM ghcr.io/home-assistant/aarch64-base:latest
 
 RUN apk add --no-cache python3 py3-pip
-RUN pip3 install deepgram-sdk==3.* wyoming --break-system-packages
 
 WORKDIR /app
-COPY rootfs /
+COPY requirements.txt /app/
+RUN pip3 install -r requirements.txt --break-system-packages
 
+COPY rootfs /
 COPY deepgram_server.py /app
 
 HEALTHCHECK --start-period=10m \

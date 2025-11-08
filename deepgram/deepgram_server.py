@@ -6,6 +6,7 @@ import threading
 import struct
 import time
 from deepgram import DeepgramClient
+from deepgram.core.events import EventType
 from wyoming.event import Event
 from wyoming.server import AsyncEventHandler, AsyncServer
 from wyoming.info import Info, Describe, AsrProgram, AsrModel, Attribution
@@ -315,89 +316,19 @@ class DeepgramSTT:
                     except Exception as e:
                         logger.error(f"Error in message handler: {e}", exc_info=True)
                 
-                # Connect to v2/listen endpoint for streaming
-                # Based on official docs: client.listen.v2.connect() 
-                # Note: live is deprecated, use websocket instead
-                listen_obj = self.dg_client.listen
-                connection_context = None
-                
-                # Path 1: listen.v2 (official docs pattern)
-                if hasattr(listen_obj, 'v2'):
-                    v2_obj = listen_obj.v2
-                    if hasattr(v2_obj, 'connect'):
-                        connection_context = v2_obj.connect(
-                            model=self.model,
-                            encoding="linear16",
-                            sample_rate=str(sample_rate)
-                        )
-                        logger.debug("Using API path: listen.v2.connect")
-                
-                # Path 2: listen.websocket.v2 (recommended, websocket is not deprecated)
-                if not connection_context and hasattr(listen_obj, 'websocket'):
-                    websocket_obj = listen_obj.websocket
-                    websocket_attrs = [attr for attr in dir(websocket_obj) if not attr.startswith('_')]
-                    logger.debug(f"Websocket attributes: {websocket_attrs}")
-                    
-                    # Check if websocket has v2
-                    if hasattr(websocket_obj, 'v2'):
-                        v2_obj = websocket_obj.v2
-                        if hasattr(v2_obj, 'connect'):
-                            connection_context = v2_obj.connect(
-                                model=self.model,
-                                encoding="linear16",
-                                sample_rate=str(sample_rate)
-                            )
-                            logger.debug("Using API path: listen.websocket.v2.connect")
-                    
-                    # Check if websocket has v (like live has)
-                    if not connection_context and hasattr(websocket_obj, 'v'):
-                        v_obj = websocket_obj.v
-                        v_attrs = [attr for attr in dir(v_obj) if not attr.startswith('_')]
-                        logger.debug(f"Websocket.v attributes: {v_attrs}")
-                        
-                        # Check if v has '2' or 'connect'
-                        if hasattr(v_obj, '2'):
-                            v2_obj = getattr(v_obj, '2')
-                            if hasattr(v2_obj, 'connect'):
-                                connection_context = v2_obj.connect(
-                                    model=self.model,
-                                    encoding="linear16",
-                                    sample_rate=str(sample_rate)
-                                )
-                                logger.debug("Using API path: listen.websocket.v.2.connect")
-                        elif hasattr(v_obj, 'connect'):
-                            connection_context = v_obj.connect(
-                                model=self.model,
-                                encoding="linear16",
-                                sample_rate=str(sample_rate)
-                            )
-                            logger.debug("Using API path: listen.websocket.v.connect")
-                    
-                    # Or direct connect method
-                    if not connection_context and hasattr(websocket_obj, 'connect'):
-                        connection_context = websocket_obj.connect(
-                            model=self.model,
-                            encoding="linear16",
-                            sample_rate=str(sample_rate)
-                        )
-                        logger.debug("Using API path: listen.websocket.connect")
-                
-                if not connection_context:
-                    # Log available attributes for debugging
-                    listen_attrs = [attr for attr in dir(listen_obj) if not attr.startswith('_')]
-                    logger.error(f"Available listen attributes: {listen_attrs}")
-                    if hasattr(listen_obj, 'websocket'):
-                        websocket_attrs = [attr for attr in dir(listen_obj.websocket) if not attr.startswith('_')]
-                        logger.error(f"Available websocket attributes: {websocket_attrs}")
-                        if hasattr(listen_obj.websocket, 'v'):
-                            v_attrs = [attr for attr in dir(listen_obj.websocket.v) if not attr.startswith('_')]
-                            logger.error(f"Available websocket.v attributes: {v_attrs}")
-                    raise AttributeError("Could not find Deepgram streaming API path. Please check SDK version.")
+                # Connect to v2/listen endpoint for streaming using SDK 5.3.0+ pattern
+                # SDK 5.3.0+ uses: client.listen.v2.connect() as per official docs
+                connection_context = self.dg_client.listen.v2.connect(
+                    model=self.model,
+                    encoding="linear16",
+                    sample_rate=str(sample_rate)
+                )
+                logger.debug("Using API path: listen.v2.connect (SDK 5.3.0+)")
                 
                 with connection_context as connection:
                     logger.info("Connected to Deepgram Flux streaming API")
                     
-                    # Set up event handlers using official EventType from documentation
+                    # Set up event handlers using EventType from SDK 5.3.0+
                     def on_close(_):
                         # When connection closes, we have the final transcript
                         logger.debug("Connection closed, using final transcript")
@@ -411,7 +342,6 @@ class DeepgramSTT:
                     
                     # Use EventType from deepgram.core.events as per official docs
                     try:
-                        from deepgram.core.events import EventType
                         connection.on(EventType.OPEN, lambda _: logger.debug("Flux connection opened"))
                         connection.on(EventType.MESSAGE, on_message)
                         connection.on(EventType.CLOSE, on_close)
@@ -431,8 +361,7 @@ class DeepgramSTT:
                     # Start listening for messages (per official docs, call before sending)
                     listening_thread = threading.Thread(target=connection.start_listening, daemon=True)
                     listening_thread.start()
-                    # Give it a moment to start
-                    time.sleep(0.1)
+                    time.sleep(0.1)  # Give it a moment to start
                     
                     # For streaming API, we need raw PCM (not WAV with header)
                     # Check if audio_data is WAV (has RIFF header) or raw PCM
@@ -463,6 +392,7 @@ class DeepgramSTT:
                     for i in range(0, len(pcm_data), chunk_size_bytes):
                         chunk = pcm_data[i:i + chunk_size_bytes]
                         if chunk:
+                            # SDK 5.3.0+ uses send_media() method
                             connection.send_media(chunk)
                             bytes_sent += len(chunk)
                             chunk_count += 1
@@ -658,93 +588,30 @@ class StreamingSession:
                 logger.error(f"Streaming connection error: code={error_code}, description={error_desc}, error={error}")
             
             try:
-                # Connect to v2/listen endpoint for streaming
-                # Based on official docs: client.listen.v2.connect() 
-                # Note: live is deprecated, use websocket instead
-                listen_obj = self.dg_client.listen
-                connection_context = None
+                # Connect to v2/listen endpoint for streaming using SDK 5.3.0+ pattern
+                # SDK 5.3.0+ uses: client.listen.v2.connect() as per official docs
+                self.connection_context = self.dg_client.listen.v2.connect(
+                    model=self.model,
+                    encoding="linear16",
+                    sample_rate="16000"
+                )
+                logger.debug("Using API path: listen.v2.connect (SDK 5.3.0+)")
                 
-                # Path 1: listen.v2 (official docs pattern)
-                if hasattr(listen_obj, 'v2'):
-                    v2_obj = listen_obj.v2
-                    if hasattr(v2_obj, 'connect'):
-                        connection_context = v2_obj.connect(
-                            model=self.model,
-                            encoding="linear16",
-                            sample_rate="16000"
-                        )
-                        logger.debug("Using API path: listen.v2.connect")
-                
-                # Path 2: listen.websocket.v2 (recommended, websocket is not deprecated)
-                if not connection_context and hasattr(listen_obj, 'websocket'):
-                    websocket_obj = listen_obj.websocket
-                    websocket_attrs = [attr for attr in dir(websocket_obj) if not attr.startswith('_')]
-                    logger.debug(f"Websocket attributes: {websocket_attrs}")
-                    
-                    # Check if websocket has v2
-                    if hasattr(websocket_obj, 'v2'):
-                        v2_obj = websocket_obj.v2
-                        if hasattr(v2_obj, 'connect'):
-                            connection_context = v2_obj.connect(
-                                model=self.model,
-                                encoding="linear16",
-                                sample_rate="16000"
-                            )
-                            logger.debug("Using API path: listen.websocket.v2.connect")
-                    
-                    # Check if websocket has v (like live has)
-                    if not connection_context and hasattr(websocket_obj, 'v'):
-                        v_obj = websocket_obj.v
-                        v_attrs = [attr for attr in dir(v_obj) if not attr.startswith('_')]
-                        logger.debug(f"Websocket.v attributes: {v_attrs}")
-                        
-                        # Check if v has '2' or 'connect'
-                        if hasattr(v_obj, '2'):
-                            v2_obj = getattr(v_obj, '2')
-                            if hasattr(v2_obj, 'connect'):
-                                connection_context = v2_obj.connect(
-                                    model=self.model,
-                                    encoding="linear16",
-                                    sample_rate="16000"
-                                )
-                                logger.debug("Using API path: listen.websocket.v.2.connect")
-                        elif hasattr(v_obj, 'connect'):
-                            connection_context = v_obj.connect(
-                                model=self.model,
-                                encoding="linear16",
-                                sample_rate="16000"
-                            )
-                            logger.debug("Using API path: listen.websocket.v.connect")
-                    
-                    # Or direct connect method
-                    if not connection_context and hasattr(websocket_obj, 'connect'):
-                        connection_context = websocket_obj.connect(
-                            model=self.model,
-                            encoding="linear16",
-                            sample_rate="16000"
-                        )
-                        logger.debug("Using API path: listen.websocket.connect")
-                
-                if not connection_context:
-                    # Log available attributes for debugging
-                    listen_attrs = [attr for attr in dir(listen_obj) if not attr.startswith('_')]
-                    logger.error(f"Available listen attributes: {listen_attrs}")
-                    if hasattr(listen_obj, 'websocket'):
-                        websocket_attrs = [attr for attr in dir(listen_obj.websocket) if not attr.startswith('_')]
-                        logger.error(f"Available websocket attributes: {websocket_attrs}")
-                        if hasattr(listen_obj.websocket, 'v'):
-                            v_attrs = [attr for attr in dir(listen_obj.websocket.v) if not attr.startswith('_')]
-                            logger.error(f"Available websocket.v attributes: {v_attrs}")
-                    raise AttributeError("Could not find Deepgram streaming API path. Please check SDK version.")
-                
-                self.connection_context = connection_context
                 self.connection = self.connection_context.__enter__()
                 
                 logger.info("Connected to Deepgram streaming API")
                 
-                # Set up event handlers
+                # Set up event handlers using EventType from SDK 5.3.0+
+                def on_close():
+                    logger.debug("Streaming connection closed")
+                
+                def on_error(error):
+                    error_code = getattr(error, 'code', None)
+                    error_desc = getattr(error, 'description', None)
+                    logger.error(f"Streaming connection error: code={error_code}, description={error_desc}, error={error}")
+                
+                # Use EventType from deepgram.core.events as per official docs
                 try:
-                    from deepgram.core.events import EventType
                     self.connection.on(EventType.OPEN, lambda _: logger.debug("Streaming connection opened"))
                     self.connection.on(EventType.MESSAGE, on_message)
                     self.connection.on(EventType.CLOSE, on_close)
@@ -777,7 +644,7 @@ class StreamingSession:
         """Send audio chunk to the streaming connection (like faster-whisper processes chunks incrementally)"""
         if self.connection:
             try:
-                # Send chunk immediately (incremental processing like faster-whisper)
+                # SDK 5.3.0+ uses send_media() method
                 self.connection.send_media(chunk)
             except Exception as e:
                 logger.error(f"Error sending chunk to streaming connection: {e}", exc_info=True)
@@ -786,6 +653,7 @@ class StreamingSession:
         """Close the streaming connection"""
         if self.connection_context and self.connection:
             try:
+                # SDK 5.3.0+ uses context manager __exit__ to close
                 self.connection_context.__exit__(None, None, None)
             except Exception as e:
                 logger.error(f"Error closing streaming connection: {e}")

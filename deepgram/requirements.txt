@@ -1,4 +1,4 @@
-deepgram-sdk>=5.0
+deepgram-sdk>=5.3.0
 wyoming
 
 # Optional dependencies for test_client_flux.py (real-time microphone streaming):
