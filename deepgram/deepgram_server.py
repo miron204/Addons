@@ -493,10 +493,12 @@ class StreamingSession:
         self.last_sent_transcript = ""
         self.listening_thread = None
         self._lock = threading.Lock()
+        self.end_of_turn = threading.Event()
     
     async def start(self):
         """Start the streaming connection - following faster-whisper pattern"""
         loop = asyncio.get_event_loop()
+        self.end_of_turn.clear()
         
         def run_streaming():
             def on_message(message):
@@ -581,11 +583,17 @@ class StreamingSession:
             
             def on_close(_):
                 logger.debug("Streaming connection closed")
+                self.end_of_turn.set()
             
             def on_error(error):
                 error_code = getattr(error, 'code', None)
                 error_desc = getattr(error, 'description', None)
                 logger.error(f"Streaming connection error: code={error_code}, description={error_desc}, error={error}")
+                self.end_of_turn.set()
+
+            def on_end_of_turn(_):
+                logger.debug("EndOfTurn received")
+                self.end_of_turn.set()
             
             try:
                 # Connect to v2/listen endpoint for streaming using SDK 5.3.0+ pattern
@@ -600,15 +608,6 @@ class StreamingSession:
                 self.connection = self.connection_context.__enter__()
                 logger.info("Connected to Deepgram streaming API")
                 
-                # Set up event handlers using EventType from SDK 5.3.0+
-                def on_close(_):
-                    logger.debug("Streaming connection closed")
-                
-                def on_error(error):
-                    error_code = getattr(error, 'code', None)
-                    error_desc = getattr(error, 'description', None)
-                    logger.error(f"Streaming connection error: code={error_code}, description={error_desc}, error={error}")
-                
                 # Use EventType from deepgram.core.events as per official docs
                 try:
                     self.connection.on(EventType.OPEN, lambda _: logger.debug("Streaming connection opened"))
@@ -616,7 +615,7 @@ class StreamingSession:
                     self.connection.on(EventType.CLOSE, on_close)
                     self.connection.on(EventType.ERROR, on_error)
                     if hasattr(EventType, 'END_OF_TURN'):
-                        self.connection.on(EventType.END_OF_TURN, lambda _: logger.debug("EndOfTurn received"))
+                        self.connection.on(EventType.END_OF_TURN, on_end_of_turn)
                 except (ImportError, AttributeError) as e:
                     logger.debug(f"Using EventType failed: {e}, trying fallback")
                     # Fallback to string-based event names
@@ -624,7 +623,7 @@ class StreamingSession:
                     self.connection.on("message", on_message)
                     self.connection.on("close", on_close)
                     self.connection.on("error", on_error)
-                    self.connection.on("end_of_turn", lambda _: logger.debug("EndOfTurn received"))
+                    self.connection.on("end_of_turn", on_end_of_turn)
                 
                 # Start listening for messages (per Deepgram docs, call before sending)
                 self.listening_thread = threading.Thread(target=self.connection.start_listening, daemon=True)
@@ -647,6 +646,10 @@ class StreamingSession:
                 self.connection.send_media(chunk)
             except Exception as e:
                 logger.error(f"Error sending chunk to streaming connection: {e}", exc_info=True)
+
+    def wait_for_completion(self, timeout: float = 3.0) -> bool:
+        """Block until Deepgram signals the end of the turn or timeout expires."""
+        return self.end_of_turn.wait(timeout)
     
     def close(self):
         """Close the streaming connection"""
@@ -799,8 +802,15 @@ class EventHandler(AsyncEventHandler):
                     if self.audio_data:
                         self.streaming_connection.send_media(self.audio_data)
                     
+                    # Wait briefly for EndOfTurn/final events before closing
+                    def wait_for_end():
+                        return self.streaming_connection.wait_for_completion(timeout=3.0)
+
+                    completed = await loop.run_in_executor(None, wait_for_end)
+                    if not completed:
+                        logger.debug("Timed out waiting for EndOfTurn; closing stream anyway")
+                    
                     # Close the connection
-                    loop = asyncio.get_event_loop()
                     def close_stream():
                         try:
                             self.streaming_connection.close()
@@ -810,6 +820,7 @@ class EventHandler(AsyncEventHandler):
                     await loop.run_in_executor(None, close_stream)
                     self.streaming_connection = None
                     self.streaming_active = False
+                    self.audio_data = b""
                     logger.info("✅ Streaming transcription finalized")
                 except Exception as e:
                     logger.error(f"Error finalizing streaming: {e}", exc_info=True)
