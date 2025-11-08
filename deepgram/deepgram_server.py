@@ -650,6 +650,10 @@ class StreamingSession:
     def wait_for_completion(self, timeout: float = 3.0) -> bool:
         """Block until Deepgram signals the end of the turn or timeout expires."""
         return self.end_of_turn.wait(timeout)
+
+    def get_final_transcript(self) -> str:
+        with self._lock:
+            return self.final_transcript or ""
     
     def close(self):
         """Close the streaming connection"""
@@ -810,6 +814,8 @@ class EventHandler(AsyncEventHandler):
                     if not completed:
                         logger.debug("Timed out waiting for EndOfTurn; closing stream anyway")
                     
+                    final_transcript = self.streaming_connection.get_final_transcript().strip()
+                    
                     # Close the connection
                     def close_stream():
                         try:
@@ -822,6 +828,13 @@ class EventHandler(AsyncEventHandler):
                     self.streaming_active = False
                     self.audio_data = b""
                     logger.info("✅ Streaming transcription finalized")
+
+                    if final_transcript:
+                        result_event = Event(type="transcript", data={"text": final_transcript})
+                        logger.info(f"Sending Transcript Event: {final_transcript}")
+                        await self.write_event(result_event)
+                    else:
+                        logger.warning("Streaming completed but no transcript was produced.")
                 except Exception as e:
                     logger.error(f"Error finalizing streaming: {e}", exc_info=True)
             else:
