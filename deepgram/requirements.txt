@@ -1,0 +1,8 @@
+deepgram-sdk>=5.0
+wyoming
+
+# Optional dependencies for test_client_flux.py (real-time microphone streaming):
+# Install one of these for microphone input:
+# pyaudio  # Recommended for most systems
+# sounddevice  # Alternative (also requires numpy)
+

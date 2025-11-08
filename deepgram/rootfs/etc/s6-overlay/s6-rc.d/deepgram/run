@@ -1,0 +1,22 @@
+#!/command/with-contenv bashio
+# vim: ft=bash
+# shellcheck shell=bash
+# ==============================================================================
+# Start Deepgram service
+# ==============================================================================
+
+model="$(bashio::config 'model')"
+if [ "${model}" = 'custom' ]; then
+    # Override with custom model
+    model="$(bashio::config 'custom_model')"
+    if [ -z "${model}" ]; then
+      bashio::exit.nok "Custom model is not set"
+    fi
+fi
+
+if bashio::config.true 'debug_logging'; then
+    flags+=('--debug')
+fi
+
+# shellcheck disable=SC2068
+exec python3 /app/deepgram_server.py

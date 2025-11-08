@@ -1,0 +1,8 @@
+---
+configuration:
+  api_key:
+    name: Deepgram API key
+    description: >-
+      Your personal API key which you can create in the Deepgram console.
+network:
+  10301/tcp: Deepgram Wyoming Protocol
