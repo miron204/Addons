@@ -819,50 +819,72 @@ class EventHandler(AsyncEventHandler):
             if self.streaming_active and self.streaming_connection:
                 # Streaming mode: finalize the stream
                 try:
+                    session = self.streaming_connection
                     # Close the streaming connection (in executor since it's sync)
                     loop = asyncio.get_event_loop()
                     
                     # Send final chunk if any remaining audio
                     if self.audio_data:
-                        self.streaming_connection.send_media(self.audio_data)
+                        session.send_media(self.audio_data)
                     
-                    # Wait briefly for EndOfTurn/final events before closing
+                    # Determine the best transcript available so far
+                    provisional_transcript = session.get_final_transcript().strip()
+                    if not provisional_transcript:
+                        provisional_transcript = self.streaming_transcript.strip()
+
+                    # Deliver the transcript to Home Assistant immediately before waiting,
+                    # to avoid the client closing the socket while we wait on Deepgram.
+                    if provisional_transcript:
+                        result_event = Event(
+                            type="transcript",
+                            data={"text": provisional_transcript, "final": True},
+                        )
+                        logger.info(f"Sending Transcript Event: {provisional_transcript}")
+                        await self._safe_write_event(result_event)
+                        session.final_sent = True
+                    else:
+                        logger.warning("No transcript available yet; will wait briefly for completion.")
+
+                    # Wait briefly for EndOfTurn/final events before closing (in case more arrive)
                     def wait_for_end():
-                        return self.streaming_connection.wait_for_completion(timeout=3.0)
+                        return session.wait_for_completion(timeout=3.0)
 
                     completed = await loop.run_in_executor(None, wait_for_end)
                     if not completed:
                         logger.debug("Timed out waiting for EndOfTurn; closing stream anyway")
                     
-                    final_transcript = self.streaming_connection.get_final_transcript().strip()
-                    
                     # Close the connection
                     def close_stream():
                         try:
-                            self.streaming_connection.close()
+                            session.close()
                         except Exception as e:
                             logger.error(f"Error closing streaming connection: {e}")
                     
                     await loop.run_in_executor(None, close_stream)
-                    self.streaming_connection = None
                     self.streaming_active = False
                     self.audio_data = b""
-                    final_transcript = final_transcript or self.streaming_transcript.strip()
-                    self.streaming_transcript = ""
                     logger.info("✅ Streaming transcription finalized")
 
-                    final_already_sent = getattr(self.streaming_connection, "final_sent", False)
-                    if final_transcript and not final_already_sent:
-                        result_event = Event(
-                            type="transcript",
-                            data={"text": final_transcript, "final": True},
-                        )
-                        logger.info(f"Sending Transcript Event: {final_transcript}")
-                        await self._safe_write_event(result_event)
-                    elif final_already_sent:
-                        logger.debug("Final transcript already delivered during streaming; skipping duplicate send.")
-                    else:
-                        logger.warning("Streaming completed but no transcript was produced.")
+                    final_already_sent = getattr(session, "final_sent", False)
+                    if not final_already_sent:
+                        # Attempt to send again with whatever text we have, if the earlier send didn't happen
+                        final_transcript = provisional_transcript
+                        if not final_transcript:
+                            final_transcript = session.get_final_transcript().strip()
+                        if not final_transcript:
+                            final_transcript = self.streaming_transcript.strip()
+
+                        if final_transcript:
+                            result_event = Event(
+                                type="transcript",
+                                data={"text": final_transcript, "final": True},
+                            )
+                            logger.info(f"Sending Transcript Event: {final_transcript}")
+                            await self._safe_write_event(result_event)
+                        else:
+                            logger.warning("Streaming completed but no transcript was produced.")
+                    self.streaming_transcript = ""
+                    self.streaming_connection = None
                 except Exception as e:
                     logger.error(f"Error finalizing streaming: {e}", exc_info=True)
             else:
