@@ -550,63 +550,30 @@ class StreamingSession:
                     if transcript_text and transcript_text.strip():
                         text = transcript_text.strip()
                         with self._lock:
-                            old_length = len(self.final_transcript) if self.final_transcript else 0
-                            new_length = len(text)
                             final_flag = bool(is_final)
                             self.final_transcript = text
                             
-                            # For streaming, send ALL updates (like faster-whisper yields segments incrementally)
-                            # Only filter out if new transcript is much shorter (likely a fragment)
-                            should_send = False
-                            
-                            if old_length == 0:
-                                # First transcript - always send
-                                should_send = True
-                                self.final_transcript = text
-                            elif new_length > old_length:
-                                # Longer transcript - refinement, always send
-                                should_send = True
-                                self.final_transcript = text
-                            elif new_length >= old_length * 0.8:
-                                # Similar length - might be correction, send if different
-                                if text != self.final_transcript:
-                                    should_send = True
-                                    self.final_transcript = text
-                            else:
-                                # Much shorter - likely fragment, ignore
-                                logger.debug(f"Ignoring shorter fragment: {new_length} chars (current: {old_length} chars)")
-                            
-                            # Ensure final transcripts are delivered even if identical to last sent
-                            if not should_send and final_flag and text == self.last_sent_transcript:
-                                should_send = True
-                            
-                            # Send update if needed
-                            if should_send and text != self.last_sent_transcript:
-                                self.final_transcript = text
-                                self.last_sent_transcript = text
-                                try:
-                                    asyncio.run_coroutine_threadsafe(
-                                        self.transcript_callback(text, final_flag),
-                                        self.event_loop
-                                    )
-                                    logger.debug(f"📤 Sent streaming transcript update: {text[:50]}...")
-                                except Exception as e:
-                                    logger.error(f"Error calling transcript callback: {e}", exc_info=True)
-                                finally:
-                                    if final_flag:
+                            if final_flag:
+                                # Send only the final transcript to the Wyoming client
+                                if text != self.last_sent_transcript or not self.final_sent:
+                                    self.last_sent_transcript = text
+                                    try:
+                                        asyncio.run_coroutine_threadsafe(
+                                            self.transcript_callback(text, True),
+                                            self.event_loop
+                                        )
+                                        logger.debug(f"📤 Sent final streaming transcript: {text[:50]}...")
+                                    except Exception as e:
+                                        logger.error(f"Error calling transcript callback: {e}", exc_info=True)
+                                    finally:
                                         self.final_sent = True
-                            elif final_flag and text == self.last_sent_transcript:
-                                # Already sent this text, but need to mark it final.
-                                try:
-                                    asyncio.run_coroutine_threadsafe(
-                                        self.transcript_callback(text, True),
-                                        self.event_loop
-                                    )
-                                    logger.debug("📤 Re-sent final transcript confirmation")
-                                except Exception as e:
-                                    logger.error(f"Error calling transcript callback for final confirmation: {e}", exc_info=True)
-                                finally:
-                                    self.final_sent = True
+                                else:
+                                    logger.debug("Final transcript already sent; skipping duplicate emit.")
+                            else:
+                                # Interim transcript - store for later but do not emit to Wyoming
+                                logger.debug(f"Received interim transcript (ignored): {text[:50]}...")
+                                self.final_sent = False
+                                self.last_sent_transcript = text
                 except Exception as e:
                     logger.error(f"Error in streaming message handler: {e}", exc_info=True)
             
@@ -725,6 +692,9 @@ class EventHandler(AsyncEventHandler):
             await self.write_event(event)
         except (BrokenPipeError, ConnectionResetError) as exc:
             logger.warning(f"Client disconnected before event delivery: {exc}")
+        except TypeError as exc:
+            # Happens when the underlying transport was already closed and asyncio Streams flips to None
+            logger.warning(f"Transport already closed while sending event: {exc}")
         except Exception as exc:
             logger.error(f"Unexpected error sending event: {exc}", exc_info=True)
     WYOMING_INFO = Info(
