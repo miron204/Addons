@@ -244,25 +244,55 @@ class StreamingSession:
             # The SDK structure may vary between versions
             api_path = None
             
-            # Check available attributes to determine correct path
-            if hasattr(self.dg_client, 'listen'):
-                listen_obj = self.dg_client.listen
-                # Check if v1 exists directly
-                if hasattr(listen_obj, 'v1'):
-                    api_path = listen_obj.v1.media.transcribe_file
-                # Check if rest exists
-                elif hasattr(self.dg_client, 'rest') and hasattr(self.dg_client.rest, 'v1'):
-                    api_path = self.dg_client.rest.v1.listen.media.transcribe_file
-                # Try alternative path
-                elif hasattr(listen_obj, 'rest') and hasattr(listen_obj.rest, 'v1'):
-                    api_path = listen_obj.rest.v1.media.transcribe_file
-                else:
-                    # Log available attributes for debugging
+            # First, log what's available for debugging
+            listen_obj = getattr(self.dg_client, 'listen', None)
+            if listen_obj:
+                listen_attrs = [attr for attr in dir(listen_obj) if not attr.startswith('_')]
+                logger.debug(f"ListenRouter attributes: {listen_attrs}")
+            
+            # Try different API paths - try rest.v1 first (more likely in SDK 5.x)
+            try:
+                # Path 1: dg_client.rest.v1.listen.media.transcribe_file (most likely in SDK 5.x)
+                if hasattr(self.dg_client, 'rest'):
+                    rest_obj = self.dg_client.rest
+                    if hasattr(rest_obj, 'v1'):
+                        v1_obj = rest_obj.v1
+                        if hasattr(v1_obj, 'listen') and hasattr(v1_obj.listen, 'media'):
+                            api_path = v1_obj.listen.media.transcribe_file
+                            logger.debug("Using API path: rest.v1.listen.media.transcribe_file")
+            except AttributeError as e:
+                logger.debug(f"Path 1 (rest.v1) failed: {e}")
+            
+            if not api_path:
+                try:
+                    # Path 2: dg_client.listen.v1.media.transcribe_file (if v1 exists on listen)
+                    if listen_obj and hasattr(listen_obj, 'v1'):
+                        api_path = listen_obj.v1.media.transcribe_file
+                        logger.debug("Using API path: listen.v1.media.transcribe_file")
+                except AttributeError as e:
+                    logger.debug(f"Path 2 (listen.v1) failed: {e}")
+            
+            if not api_path:
+                try:
+                    # Path 3: Use REST client directly (alternative SDK structure)
+                    if hasattr(self.dg_client, 'rest'):
+                        # Some SDK versions use rest.transcription.sync_prerecorded
+                        if hasattr(self.dg_client.rest, 'transcription'):
+                            # Try to find transcribe method
+                            trans_obj = self.dg_client.rest.transcription
+                            if hasattr(trans_obj, 'transcribe_file'):
+                                api_path = trans_obj.transcribe_file
+                                logger.debug("Using API path: rest.transcription.transcribe_file")
+                except AttributeError:
+                    pass
+            
+            if not api_path:
+                # Log all available attributes for debugging
+                dg_attrs = [attr for attr in dir(self.dg_client) if not attr.startswith('_')]
+                logger.error(f"Available dg_client attributes: {dg_attrs}")
+                if listen_obj:
                     logger.error(f"Available listen attributes: {[attr for attr in dir(listen_obj) if not attr.startswith('_')]}")
-                    logger.error(f"Available dg_client attributes: {[attr for attr in dir(self.dg_client) if not attr.startswith('_')]}")
-                    raise AttributeError("Could not find Deepgram v1 API path. Please check SDK version.")
-            else:
-                raise AttributeError("Deepgram client does not have 'listen' attribute")
+                raise AttributeError("Could not find Deepgram v1 API path. Please check SDK version and update code.")
             
             if is_wav:
                 # WAV file - SDK auto-detects format
