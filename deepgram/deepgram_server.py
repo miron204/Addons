@@ -784,7 +784,10 @@ class EventHandler(AsyncEventHandler):
                     # Define callback to capture progressive transcripts (stored until final send)
                     async def send_transcript(text: str):
                         self.streaming_transcript = text
-                        result_event = Event(type="transcript", data={"text": text})
+                        result_event = Event(
+                            type="transcript",
+                            data={"text": text, "final": False},
+                        )
                         await self._safe_write_event(result_event)
                         logger.debug(f"📤 Sent streaming transcript update: {text[:50]}...")
                     
@@ -856,7 +859,10 @@ class EventHandler(AsyncEventHandler):
                     logger.info("✅ Streaming transcription finalized")
 
                     if final_transcript:
-                        result_event = Event(type="transcript", data={"text": final_transcript})
+                        result_event = Event(
+                            type="transcript",
+                            data={"text": final_transcript, "final": True},
+                        )
                         logger.info(f"Sending Transcript Event: {final_transcript}")
                         await self._safe_write_event(result_event)
                     else:
