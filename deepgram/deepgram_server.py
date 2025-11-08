@@ -579,7 +579,7 @@ class StreamingSession:
                 except Exception as e:
                     logger.error(f"Error in streaming message handler: {e}", exc_info=True)
             
-            def on_close():
+            def on_close(_):
                 logger.debug("Streaming connection closed")
             
             def on_error(error):
@@ -598,11 +598,10 @@ class StreamingSession:
                 logger.debug("Using API path: listen.v2.connect (SDK 5.3.0+)")
                 
                 self.connection = self.connection_context.__enter__()
-                
                 logger.info("Connected to Deepgram streaming API")
                 
                 # Set up event handlers using EventType from SDK 5.3.0+
-                def on_close():
+                def on_close(_):
                     logger.debug("Streaming connection closed")
                 
                 def on_error(error):
