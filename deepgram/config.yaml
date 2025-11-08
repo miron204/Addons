@@ -12,3 +12,5 @@ ports:
   "10301/tcp": null
 schema:
   api_key: str
+  model: str?
+  debug: bool?

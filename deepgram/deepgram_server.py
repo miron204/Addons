@@ -11,10 +11,6 @@ from wyoming.event import Event
 from wyoming.server import AsyncEventHandler, AsyncServer
 from wyoming.info import Info, Describe, AsrProgram, AsrModel, Attribution
 
-# Configure logging
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-logger = logging.getLogger(__name__)
-
 # Support both Docker and local testing
 OPTIONS_FILE = os.getenv("OPTIONS_FILE", "/data/options.json")
 # Fallback to local test file if Docker path doesn't exist
@@ -22,6 +18,32 @@ if not os.path.exists(OPTIONS_FILE):
     local_options = os.path.join(os.path.dirname(__file__), "data", "options.json")
     if os.path.exists(local_options):
         OPTIONS_FILE = local_options
+
+def load_config():
+    """Load configuration from the options.json file."""
+    try:
+        with open(OPTIONS_FILE, "r") as f:
+            options = json.load(f)
+        return options
+    except Exception as e:
+        # Use print since logger might not be initialized yet
+        print(f"Error reading options.json: {e}")
+        print("⚠️ Configuration file not found or invalid!")
+        return {}
+
+# Load config early to set up logging level
+_initial_config = load_config()
+_debug_mode = _initial_config.get("debug", False)
+
+# Configure logging based on debug mode
+log_level = logging.DEBUG if _debug_mode else logging.INFO
+logging.basicConfig(level=log_level, format="%(asctime)s [%(levelname)s] %(message)s")
+logger = logging.getLogger(__name__)
+
+if _debug_mode:
+    logger.info("🐛 Debug mode ENABLED - verbose logging active")
+else:
+    logger.debug("Debug mode disabled - using INFO level logging")
 
 class DeepgramSTT:
     def __init__(self, model: str = "nova-3"):
@@ -917,6 +939,22 @@ class EventHandler(AsyncEventHandler):
                         except Exception as e:
                             logger.debug(f"connection.finish() raised error: {e}")
                     
+                    # CRITICAL: Send latest transcript IMMEDIATELY to prevent Home Assistant timeout
+                    # Home Assistant disconnects after ~3s if no transcript is received
+                    # Send whatever we have NOW, then refine it later
+                    latest_transcript = session.get_final_transcript().strip()
+                    if not latest_transcript:
+                        latest_transcript = self.streaming_transcript.strip()
+                    
+                    if latest_transcript:
+                        # Send immediately to keep connection alive
+                        result_event = Event(
+                            type="transcript",
+                            data={"text": latest_transcript, "final": False},  # Mark as interim initially
+                        )
+                        await self._safe_write_event(result_event)
+                        logger.info(f"📤 Sent IMMEDIATE transcript (to prevent HA timeout): {latest_transcript[:80]}...")
+                    
                     await loop.run_in_executor(None, finish_stream)
                     
                     # Wait for Deepgram to finish processing and send final transcript
@@ -937,15 +975,24 @@ class EventHandler(AsyncEventHandler):
                     logger.info(f"📋 Final transcript after processing: '{final_transcript}' (length: {len(final_transcript)})")
                     logger.info(f"📋 Last streaming transcript: '{self.streaming_transcript}' (length: {len(self.streaming_transcript)})")
                     
-                    # Always send final transcript (even if we sent interim versions)
-                    # This ensures the client gets the complete, final version
+                    # Send final refined transcript (mark as final even if same as immediate)
                     if final_transcript:
-                        result_event = Event(
-                            type="transcript",
-                            data={"text": final_transcript, "final": True},
-                        )
-                        logger.info(f"📤 Sending FINAL transcript: {final_transcript[:80]}...")
-                        await self._safe_write_event(result_event)
+                        if final_transcript != latest_transcript:
+                            # Different transcript - send the refined version
+                            result_event = Event(
+                                type="transcript",
+                                data={"text": final_transcript, "final": True},
+                            )
+                            logger.info(f"📤 Sending FINAL refined transcript: {final_transcript[:80]}...")
+                            await self._safe_write_event(result_event)
+                        elif latest_transcript:
+                            # Same transcript - just mark the previous one as final
+                            result_event = Event(
+                                type="transcript",
+                                data={"text": final_transcript, "final": True},
+                            )
+                            logger.info(f"📤 Marking transcript as FINAL: {final_transcript[:80]}...")
+                            await self._safe_write_event(result_event)
                         session.final_sent = True
                     else:
                         logger.warning("No final transcript available after processing")
@@ -990,17 +1037,6 @@ def load_api_key():
     else:
         logger.error("⚠️ API key is missing! Set it in the Deepgram addon settings.")
     return api_key
-
-def load_config():
-    """Load configuration from the options.json file."""
-    try:
-        with open(OPTIONS_FILE, "r") as f:
-            options = json.load(f)
-        return options
-    except Exception as e:
-        logger.error(f"Error reading options.json: {e}")
-        logger.error("⚠️ Configuration file not found or invalid!")
-        return {}
 
 async def main():
     """Starts the Wyoming Deepgram STT server using DeepgramServer."""
