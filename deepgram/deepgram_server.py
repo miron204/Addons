@@ -47,16 +47,14 @@ class DeepgramSTT:
     async def transcribe(self, audio_data: bytes, sample_rate: int):
         """
         Send audio data to Deepgram and return transcription.
-        Try prerecorded API first (faster), fallback to streaming for Flux if needed.
+        Flux models use streaming API (v2/listen), other models use prerecorded API (v1/listen).
         """
         if self.is_flux:
-            # Try prerecorded API first for speed (like nova-3)
-            try:
-                return await self._transcribe_prerecorded(audio_data, sample_rate)
-            except Exception as e:
-                logger.warning(f"Prerecorded API failed for Flux: {e}, falling back to streaming")
-                return await self._transcribe_flux_streaming(audio_data, sample_rate)
+            # Flux models MUST use streaming API (v2/listen), not prerecorded
+            logger.debug("Flux model detected, using streaming API")
+            return await self._transcribe_flux_streaming(audio_data, sample_rate)
         else:
+            # Non-Flux models use prerecorded API (v1/listen)
             return await self._transcribe_prerecorded(audio_data, sample_rate)
     
     async def _transcribe_prerecorded(self, audio_data: bytes, sample_rate: int):
@@ -70,50 +68,65 @@ class DeepgramSTT:
             is_wav = audio_data[:4] == b'RIFF'
             
             # Try different API paths for Deepgram SDK 5.x
-            # The SDK structure may vary between versions
+            # Based on logs: listen has 'prerecorded', 'rest', 'live', 'websocket'
+            # Note: v2 is for streaming (Flux), v1 is for prerecorded (nova-3)
             api_path = None
-            
-            # First, log what's available for debugging
             listen_obj = getattr(self.dg_client, 'listen', None)
-            if listen_obj:
-                listen_attrs = [attr for attr in dir(listen_obj) if not attr.startswith('_')]
-                logger.debug(f"ListenRouter attributes: {listen_attrs}")
             
-            # Try different API paths - try rest.v1 first (more likely in SDK 5.x)
-            try:
-                # Path 1: dg_client.rest.v1.listen.media.transcribe_file (most likely in SDK 5.x)
-                if hasattr(self.dg_client, 'rest'):
-                    rest_obj = self.dg_client.rest
-                    if hasattr(rest_obj, 'v1'):
-                        v1_obj = rest_obj.v1
-                        if hasattr(v1_obj, 'listen') and hasattr(v1_obj.listen, 'media'):
+            # Path 1: dg_client.listen.v1 (v1 API for prerecorded, similar to v2 for streaming)
+            if listen_obj and hasattr(listen_obj, 'v1'):
+                v1_obj = listen_obj.v1
+                if hasattr(v1_obj, 'media') and hasattr(v1_obj.media, 'transcribe_file'):
+                    api_path = v1_obj.media.transcribe_file
+                    logger.debug("Using API path: listen.v1.media.transcribe_file")
+                elif hasattr(v1_obj, 'prerecorded'):
+                    prerecorded_obj = v1_obj.prerecorded
+                    if hasattr(prerecorded_obj, 'transcribe_file'):
+                        api_path = prerecorded_obj.transcribe_file
+                        logger.debug("Using API path: listen.v1.prerecorded.transcribe_file")
+            
+            # Path 2: dg_client.listen.prerecorded (direct prerecorded access)
+            if not api_path and listen_obj and hasattr(listen_obj, 'prerecorded'):
+                prerecorded_obj = listen_obj.prerecorded
+                # Check what methods are available on prerecorded
+                prerecorded_attrs = [attr for attr in dir(prerecorded_obj) if not attr.startswith('_')]
+                logger.debug(f"Prerecorded attributes: {prerecorded_attrs}")
+                
+                # Try common method names
+                if hasattr(prerecorded_obj, 'transcribe_file'):
+                    api_path = prerecorded_obj.transcribe_file
+                    logger.debug("Using API path: listen.prerecorded.transcribe_file")
+                elif hasattr(prerecorded_obj, 'transcribe'):
+                    api_path = prerecorded_obj.transcribe
+                    logger.debug("Using API path: listen.prerecorded.transcribe")
+                elif hasattr(prerecorded_obj, 'sync'):
+                    sync_obj = prerecorded_obj.sync
+                    if hasattr(sync_obj, 'transcribe_file'):
+                        api_path = sync_obj.transcribe_file
+                        logger.debug("Using API path: listen.prerecorded.sync.transcribe_file")
+                    elif hasattr(sync_obj, 'transcribe'):
+                        api_path = sync_obj.transcribe
+                        logger.debug("Using API path: listen.prerecorded.sync.transcribe")
+            
+            # Path 3: dg_client.listen.rest (alternative path)
+            if not api_path and listen_obj and hasattr(listen_obj, 'rest'):
+                rest_obj = listen_obj.rest
+                if hasattr(rest_obj, 'v1'):
+                    v1_obj = rest_obj.v1
+                    if hasattr(v1_obj, 'listen') and hasattr(v1_obj.listen, 'media'):
+                        if hasattr(v1_obj.listen.media, 'transcribe_file'):
+                            api_path = v1_obj.listen.media.transcribe_file
+                            logger.debug("Using API path: listen.rest.v1.listen.media.transcribe_file")
+            
+            # Path 4: dg_client.rest (direct rest access)
+            if not api_path and hasattr(self.dg_client, 'rest'):
+                rest_obj = self.dg_client.rest
+                if hasattr(rest_obj, 'v1'):
+                    v1_obj = rest_obj.v1
+                    if hasattr(v1_obj, 'listen') and hasattr(v1_obj.listen, 'media'):
+                        if hasattr(v1_obj.listen.media, 'transcribe_file'):
                             api_path = v1_obj.listen.media.transcribe_file
                             logger.debug("Using API path: rest.v1.listen.media.transcribe_file")
-            except AttributeError as e:
-                logger.debug(f"Path 1 (rest.v1) failed: {e}")
-            
-            if not api_path:
-                try:
-                    # Path 2: dg_client.listen.v1.media.transcribe_file (if v1 exists on listen)
-                    if listen_obj and hasattr(listen_obj, 'v1'):
-                        api_path = listen_obj.v1.media.transcribe_file
-                        logger.debug("Using API path: listen.v1.media.transcribe_file")
-                except AttributeError as e:
-                    logger.debug(f"Path 2 (listen.v1) failed: {e}")
-            
-            if not api_path:
-                try:
-                    # Path 3: Use REST client directly (alternative SDK structure)
-                    if hasattr(self.dg_client, 'rest'):
-                        # Some SDK versions use rest.transcription.sync_prerecorded
-                        if hasattr(self.dg_client.rest, 'transcription'):
-                            # Try to find transcribe method
-                            trans_obj = self.dg_client.rest.transcription
-                            if hasattr(trans_obj, 'transcribe_file'):
-                                api_path = trans_obj.transcribe_file
-                                logger.debug("Using API path: rest.transcription.transcribe_file")
-                except AttributeError as e:
-                    logger.debug(f"Path 3 failed: {e}")
             
             if not api_path:
                 # Log all available attributes for debugging
@@ -121,6 +134,9 @@ class DeepgramSTT:
                 logger.error(f"Available dg_client attributes: {dg_attrs}")
                 if listen_obj:
                     logger.error(f"Available listen attributes: {[attr for attr in dir(listen_obj) if not attr.startswith('_')]}")
+                    if hasattr(listen_obj, 'prerecorded'):
+                        prerecorded_attrs = [attr for attr in dir(listen_obj.prerecorded) if not attr.startswith('_')]
+                        logger.error(f"Available prerecorded attributes: {prerecorded_attrs}")
                 raise AttributeError("Could not find Deepgram v1 API path. Please check SDK version and update code.")
             
             if is_wav:
@@ -695,7 +711,7 @@ class EventHandler(AsyncEventHandler):
         super().__init__(*args, **kwargs)
 
         state = State()
-        model = load_config().get("model", "nova-3")
+        model = load_config().get("model", "flux-general-en")  # Default to Flux for streaming
         logger.info(f"Using Deepgram model: {model}")
         self.stt = DeepgramSTT(model=model)
         self.audio_data = b""
