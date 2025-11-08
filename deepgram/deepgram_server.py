@@ -501,6 +501,8 @@ class StreamingSession:
         self.listening_thread = None
         self._lock = threading.Lock()
         self.end_of_turn = threading.Event()
+        self.emitted_transcript = ""
+        self.last_update_time = 0.0
     
     async def start(self):
         """Start the streaming connection - following faster-whisper pattern"""
@@ -575,16 +577,28 @@ class StreamingSession:
                             
                             # Send progressive update if it's new (like faster-whisper yields segments)
                             if should_send and text != self.last_sent_transcript:
+                                previous_emitted = self.emitted_transcript
+                                self.final_transcript = text
                                 self.last_sent_transcript = text
-                                try:
-                                    # Send immediately (progressive updates like faster-whisper)
-                                    asyncio.run_coroutine_threadsafe(
-                                        self.transcript_callback(text), 
-                                        self.event_loop
-                                    )
-                                    logger.debug(f"📤 Sent progressive transcript update: {text[:50]}...")
-                                except Exception as e:
-                                    logger.error(f"Error calling transcript callback: {e}", exc_info=True)
+                                self.last_update_time = time.monotonic()
+
+                                if text.startswith(previous_emitted):
+                                    delta = text[len(previous_emitted):]
+                                else:
+                                    logger.debug("Transcript diverged from previously emitted text; skipping delta to avoid duplication.")
+                                    delta = ""
+
+                                self.emitted_transcript = text
+
+                                if delta:
+                                    try:
+                                        asyncio.run_coroutine_threadsafe(
+                                            self.transcript_callback(delta, text, False),
+                                            self.event_loop
+                                        )
+                                        logger.debug(f"📤 Sent progressive transcript delta: {delta[:50]}...")
+                                    except Exception as e:
+                                        logger.error(f"Error calling transcript callback: {e}", exc_info=True)
                 except Exception as e:
                     logger.error(f"Error in streaming message handler: {e}", exc_info=True)
             
@@ -763,6 +777,7 @@ class EventHandler(AsyncEventHandler):
         self.streaming_connection = None  # For streaming mode
         self.streaming_active = False
         self.streaming_transcript = ""
+        self.streaming_transcript_emitted = ""
         wyoming_info = self.WYOMING_INFO
         self.wyoming_info_event = wyoming_info.event()
 
@@ -781,15 +796,19 @@ class EventHandler(AsyncEventHandler):
             # For Flux models, start streaming connection
             if self.stt.is_flux:
                 try:
+                    self.streaming_transcript = ""
+                    self.streaming_transcript_emitted = ""
                     # Define callback to capture progressive transcripts (stored until final send)
-                    async def send_transcript(text: str):
-                        self.streaming_transcript = text
-                        result_event = Event(
-                            type="transcript",
-                            data={"text": text, "final": False},
-                        )
-                        await self._safe_write_event(result_event)
-                        logger.debug(f"📤 Sent streaming transcript update: {text[:50]}...")
+                    async def send_transcript(delta: str, full_text: str, is_final: bool):
+                        self.streaming_transcript = full_text
+                        if delta:
+                            result_event = Event(
+                                type="transcript",
+                                data={"text": delta, "final": is_final},
+                            )
+                            await self._safe_write_event(result_event)
+                            logger.debug(f"📤 Sent streaming transcript delta: {delta[:50]}...")
+                            self.streaming_transcript_emitted += delta
                     
                     self.streaming_connection = await self.stt.start_streaming(
                         self.sample_rate, 
@@ -859,14 +878,21 @@ class EventHandler(AsyncEventHandler):
                     logger.info("✅ Streaming transcription finalized")
 
                     if final_transcript:
+                        emitted_so_far = self.streaming_transcript_emitted
+                        if final_transcript.startswith(emitted_so_far):
+                            final_delta = final_transcript[len(emitted_so_far):]
+                        else:
+                            final_delta = final_transcript
+                        self.streaming_transcript_emitted = ""
                         result_event = Event(
                             type="transcript",
-                            data={"text": final_transcript, "final": True},
+                            data={"text": final_delta, "final": True},
                         )
                         logger.info(f"Sending Transcript Event: {final_transcript}")
                         await self._safe_write_event(result_event)
                     else:
                         logger.warning("Streaming completed but no transcript was produced.")
+                    self.streaming_transcript_emitted = ""
                 except Exception as e:
                     logger.error(f"Error finalizing streaming: {e}", exc_info=True)
             else:
