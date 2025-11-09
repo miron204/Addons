@@ -387,7 +387,7 @@ class DeepgramSTT:
                     # Start listening for messages (per official docs, call before sending)
                     listening_thread = threading.Thread(target=connection.start_listening, daemon=True)
                     listening_thread.start()
-                    time.sleep(0.1)  # Give it a moment to start
+                    listening_thread.join(timeout=0.05)  # Briefly yield to listener thread
                     
                     # For streaming API, we need raw PCM (not WAV with header)
                     # Check if audio_data is WAV (has RIFF header) or raw PCM
@@ -444,7 +444,7 @@ class DeepgramSTT:
                     while not final_transcript and time.monotonic() < first_message_timeout:
                         if transcript_received.is_set():
                             break
-                        time.sleep(0.1)
+                        time.sleep(0.05)
                     
                     if not final_transcript:
                         logger.warning("No transcript messages received after initial wait")
@@ -456,8 +456,8 @@ class DeepgramSTT:
                     # For real-time streaming, Flux continues refining longer
                     # Since we're sending all audio at once, use shorter debounce for faster response
                     # But keep max_total_wait high enough to allow complete processing of long audio files
-                    debounce_seconds = 1.5  # Reduced to 1.5s for prerecorded files (was 4.0s)
-                    max_total_wait = 60.0  # Increased to 60s to allow complete processing (was 15.0s, too short)
+                    debounce_seconds = 1.2  # tuned for quicker stabilization without truncating
+                    max_total_wait = 45.0  # allow plenty of time for long clips, but finish sooner than 60s
                     start_wait = time.monotonic()
                     last_logged_length = 0
                     logger.info("Waiting for EndOfTurn or transcript stabilization...")
@@ -543,14 +543,14 @@ class StreamingSession:
         def run_streaming():
             def on_message(message):
                 """Handle incoming transcript messages - send progressive updates like faster-whisper"""
-                logger.info(f"🔔 StreamingSession.on_message CALLED! Message type: {type(message).__name__}")
+                logger.debug(f"🔔 StreamingSession.on_message CALLED! Message type: {type(message).__name__}")
                 try:
                     transcript_text = None
                     
                     # Check message type and extract transcript (same pattern as _transcribe_flux_streaming)
                     msg_type_name = type(message).__name__
                     msg_type_attr = getattr(message, 'type', None)
-                    logger.info(f"📨 StreamingSession.on_message processing: class={msg_type_name}, type={msg_type_attr}")
+                    logger.debug(f"📨 StreamingSession.on_message processing: class={msg_type_name}, type={msg_type_attr}")
                     logger.debug(f"Message attributes: {[attr for attr in dir(message) if not attr.startswith('_')]}")
                     
                     # Filter out connection and error events
@@ -598,12 +598,12 @@ class StreamingSession:
                             transcript_start = getattr(alt, 'start', None)
                             transcript_end = getattr(alt, 'end', None)
                             if transcript_text:
-                                logger.info(f"✅ Found transcript in channel.alternatives: {transcript_text[:50]}...")
+                            logger.debug(f"✅ Found transcript in channel.alternatives: {transcript_text[:50]}...")
                     
                     # Check for direct transcript attribute
                     if not transcript_text and hasattr(message, 'transcript'):
                         transcript_text = message.transcript
-                        logger.info(f"✅ Found transcript in message.transcript: {transcript_text[:50]}...")
+                        logger.debug(f"✅ Found transcript in message.transcript: {transcript_text[:50]}...")
                     
                     # Check if message itself is a string or dict
                     if not transcript_text:
@@ -714,7 +714,7 @@ class StreamingSession:
                     name="DeepgramListener"
                 )
                 self.listening_thread.start()
-                time.sleep(0.1)  # Minimal wait for listener thread to start (reduced from 0.3s)
+                time.sleep(0.05)  # Minimal wait for listener thread to start
                 
                 # Verify listener thread is running
                 if self.listening_thread.is_alive():
@@ -1036,7 +1036,7 @@ class EventHandler(AsyncEventHandler):
                                         return True
                             
                             # Sleep briefly before checking again
-                            time.sleep(0.1)
+                            time.sleep(0.05)
                     
                     logger.info(f"Waiting for transcript to stabilize (debounce: {debounce_seconds}s, max: {max_wait_seconds}s)...")
                     await loop.run_in_executor(None, wait_for_stable_transcript)
