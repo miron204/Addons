@@ -632,20 +632,22 @@ class StreamingSession:
                                 
                                 # Send ALL updates (both interim and final) with FULL transcript
                                 # This ensures HA gets the complete sentence even if it closes after first event
-                                if text != self.last_sent_transcript:
-                                    self.last_sent_transcript = text
-                                    try:
-                                        # Call callback with final flag and timestamps (faster-whisper includes start/end)
-                                        asyncio.run_coroutine_threadsafe(
-                                            self.transcript_callback(text, final_flag, transcript_start, transcript_end),
-                                            self.event_loop
-                                        )
-                                        logger.info(f"📤 Sent streaming transcript (final={final_flag}): {text[:50]}...")
-                                    except Exception as e:
-                                        logger.error(f"Error calling transcript callback: {e}", exc_info=True)
-                                    
-                                    if final_flag:
+                                if final_flag:
+                                    if text != self.last_sent_transcript:
+                                        self.last_sent_transcript = text
+                                        try:
+                                            # Call callback with final flag and timestamps (faster-whisper includes start/end)
+                                            asyncio.run_coroutine_threadsafe(
+                                                self.transcript_callback(text, True, transcript_start, transcript_end),
+                                                self.event_loop
+                                            )
+                                            logger.info(f"📤 Prepared FINAL transcript for delivery: {text[:50]}...")
+                                        except Exception as e:
+                                            logger.error(f"Error calling transcript callback: {e}", exc_info=True)
+                                        
                                         self.final_sent = True  # Track internally for our own logic
+                                else:
+                                    logger.debug(f"🕓 Holding interim transcript (not sending to HA yet): {text[:50]}...")
                             else:
                                 logger.debug(f"Ignoring shorter fragment: {new_length} chars (keeping {old_length} chars)")
                 except Exception as e:
@@ -892,21 +894,15 @@ class EventHandler(AsyncEventHandler):
                 try:
                     self.streaming_transcript = ""
                     self.streaming_ready = False  # Reset ready flag for new connection
-                    # Define callback to capture progressive transcripts (send immediately like faster-whisper)
-                    # faster-whisper uses final: false for interim, final: true for final
-                    # faster-whisper also includes start/end timestamps
-                    # IMPORTANT: Home Assistant's STT provider behavior:
-                    # - During streaming (before audio-stop): Connection stays alive via active audio sending
-                    #   Interim transcripts are sent for real-time feedback (satellite entity may use them)
-                    # - After audio-stop: HA STT provider starts reading and takes FIRST transcript event
-                    #   So we must NOT send interim transcripts after audio-stop - only the final one
-                    #   This prevents HA from taking an incomplete transcript and missing the final one
+                    # Define callback for transcripts. To match Home Assistant's expectations we only emit
+                    # the single final transcript (final=True) and suppress all interim updates. HA currently
+                    # consumes the first transcript it receives after audio-stop, so sending interim updates
+                    # causes it to drop the refined result. We still pass timestamps when available.
                     async def send_transcript(text: str, is_final: bool = False, start: float = None, end: float = None):
                         self.streaming_transcript = text
-                        # After audio-stop, only send final transcripts (HA STT provider takes first event)
-                        # During streaming, send all transcripts (interim and final) for real-time feedback
-                        if self.audio_stop_received and not is_final:
-                            logger.debug(f"⏸️  Skipping interim transcript after audio-stop (HA will take first event): {text[:50]}...")
+                        # Only emit final transcripts to Home Assistant to avoid premature consumption
+                        if not is_final:
+                            logger.debug(f"⏸️  Skipping interim transcript (waiting for final): {text[:80]}...")
                             return
                         event_data = {"text": text, "final": is_final}  # Matches faster-whisper: false=interim, true=final
                         # Add timestamps if available (like faster-whisper)
@@ -916,7 +912,7 @@ class EventHandler(AsyncEventHandler):
                             event_data["end"] = end
                         result_event = Event(type="transcript", data=event_data)
                         await self._safe_write_event(result_event)
-                        logger.info(f"📤 Sent streaming transcript (final={is_final}): {text[:80]}...")
+                        logger.info(f"📤 Sent FINAL transcript to Home Assistant: {text[:80]}...")
                     
                     logger.info(f"🔄 Starting streaming connection for Flux model...")
                     self.streaming_connection = await self.stt.start_streaming(
