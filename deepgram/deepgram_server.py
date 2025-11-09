@@ -40,6 +40,10 @@ log_level = logging.DEBUG if _debug_mode else logging.INFO
 logging.basicConfig(level=log_level, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
 
+# Silence noisy websocket binary logs from Deepgram SDK
+logging.getLogger("websockets.client").setLevel(logging.WARNING)
+logging.getLogger("websockets.protocol").setLevel(logging.WARNING)
+
 if _debug_mode:
     logger.info("🐛 Debug mode ENABLED - verbose logging active")
 else:
@@ -576,9 +580,12 @@ class StreamingSession:
                     # Try different message formats to extract transcript (matching _transcribe_flux_streaming)
                     logger.debug(f"  Message attributes: {[attr for attr in dir(message) if not attr.startswith('_') and not callable(getattr(message, attr, None))]}")
                     
-                    # Check for channel.alternatives pattern (most common for v2 API)
+                    # Initialize transcript extraction variables
+                    transcript_text = None
                     transcript_start = None
                     transcript_end = None
+                    
+                    # Check for channel.alternatives pattern (most common for v2 API)
                     if hasattr(message, 'channel'):
                         channel = message.channel
                         logger.debug(f"  Found channel: {channel}")
@@ -840,8 +847,20 @@ class EventHandler(AsyncEventHandler):
         super().__init__(*args, **kwargs)
 
         state = State()
-        model = load_config().get("model", "flux-general-en")  # Default to Flux for streaming
+        config = load_config()
+        model = config.get("model", "flux-general-en")  # Default to Flux for streaming
         logger.info(f"Using Deepgram model: {model}")
+        
+        # Streaming mode: "batch" or "streaming"
+        # - "batch": Accumulate all audio, process at end (like faster-whisper)
+        # - "streaming": Send audio in real-time, get progressive updates
+        # Default to "batch" for better HA compatibility
+        self.streaming_mode = config.get("streaming_mode", "batch").lower()
+        if self.streaming_mode not in ["batch", "streaming"]:
+            logger.warning(f"Invalid streaming_mode '{self.streaming_mode}', defaulting to 'batch'")
+            self.streaming_mode = "batch"
+        logger.info(f"🔧 Processing mode: {self.streaming_mode.upper()}")
+        
         self.stt = DeepgramSTT(model=model)
         self.audio_data = b""
         self.sample_rate = 16000  # Default sample rate; can be adjusted
@@ -868,8 +887,10 @@ class EventHandler(AsyncEventHandler):
             # Reset flags for new audio stream
             self.audio_stop_received = False
             
-            # For Flux models, start streaming connection
-            if self.stt.is_flux:
+            # For Flux models, decide based on streaming_mode setting
+            # - "streaming": Start real-time streaming connection
+            # - "batch": Use batch processing (accumulate audio, process at end)
+            if self.stt.is_flux and self.streaming_mode == "streaming":
                 try:
                     self.streaming_transcript = ""
                     self.streaming_ready = False  # Reset ready flag for new connection
