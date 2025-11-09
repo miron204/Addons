@@ -526,11 +526,14 @@ class StreamingSession:
         self.final_sent = False
         # Connection barrier to prevent race conditions
         self.streaming_ready = asyncio.Event()
+        # Track last update time for debouncing final transcript
+        self.last_update_time = None
     
     async def start(self):
         """Start the streaming connection - following faster-whisper pattern"""
         loop = asyncio.get_event_loop()
         self.end_of_turn.clear()
+        self.last_update_time = None  # Reset update time tracking
         
         def run_streaming():
             def on_message(message):
@@ -617,6 +620,8 @@ class StreamingSession:
                             
                             if should_update:
                                 self.final_transcript = text
+                                # Update last update time for debouncing
+                                self.last_update_time = time.monotonic()
                                 
                                 # Send ALL updates (both interim and final) with FULL transcript
                                 # This ensures HA gets the complete sentence even if it closes after first event
@@ -650,20 +655,11 @@ class StreamingSession:
                 self.end_of_turn.set()
 
             def on_end_of_turn(_):
-                logger.info("🔚 EndOfTurn received - sending final transcript")
+                logger.info("🔚 EndOfTurn received - transcript processing complete")
                 self.end_of_turn.set()
-                # Send the final transcript when EndOfTurn is received (final=true like faster-whisper)
-                with self._lock:
-                    if self.final_transcript and not self.final_sent:
-                        try:
-                            asyncio.run_coroutine_threadsafe(
-                                self.transcript_callback(self.final_transcript, True),  # final=true
-                                self.event_loop
-                            )
-                            self.final_sent = True
-                            logger.info(f"📤 Sent transcript on EndOfTurn (final=True): {self.final_transcript[:80]}...")
-                        except Exception as e:
-                            logger.error(f"Error sending final transcript on EndOfTurn: {e}", exc_info=True)
+                # Don't send transcript here - let audio-stop handler send it after debounce
+                # This ensures we get the most complete transcript, not an early incomplete one
+                # The audio-stop handler will wait for debounce and send the final transcript
             
             try:
                 # Connect to v2/listen endpoint for streaming using SDK 5.3.0+ pattern
@@ -853,6 +849,7 @@ class EventHandler(AsyncEventHandler):
         self.streaming_active = False
         self.streaming_transcript = ""
         self.streaming_ready = False  # Track if connection is ready (avoid repeated waits)
+        self.audio_stop_received = False  # Track when audio-stop is received (to prevent sending interim transcripts)
         wyoming_info = self.WYOMING_INFO
         self.wyoming_info_event = wyoming_info.event()
 
@@ -868,6 +865,9 @@ class EventHandler(AsyncEventHandler):
                 self.sample_rate = event.data.get("rate", 16000)
                 logger.info(f"Audio stream started, sample rate: {self.sample_rate}")
             
+            # Reset flags for new audio stream
+            self.audio_stop_received = False
+            
             # For Flux models, start streaming connection
             if self.stt.is_flux:
                 try:
@@ -876,8 +876,19 @@ class EventHandler(AsyncEventHandler):
                     # Define callback to capture progressive transcripts (send immediately like faster-whisper)
                     # faster-whisper uses final: false for interim, final: true for final
                     # faster-whisper also includes start/end timestamps
+                    # IMPORTANT: Home Assistant's STT provider behavior:
+                    # - During streaming (before audio-stop): Connection stays alive via active audio sending
+                    #   Interim transcripts are sent for real-time feedback (satellite entity may use them)
+                    # - After audio-stop: HA STT provider starts reading and takes FIRST transcript event
+                    #   So we must NOT send interim transcripts after audio-stop - only the final one
+                    #   This prevents HA from taking an incomplete transcript and missing the final one
                     async def send_transcript(text: str, is_final: bool = False, start: float = None, end: float = None):
                         self.streaming_transcript = text
+                        # After audio-stop, only send final transcripts (HA STT provider takes first event)
+                        # During streaming, send all transcripts (interim and final) for real-time feedback
+                        if self.audio_stop_received and not is_final:
+                            logger.debug(f"⏸️  Skipping interim transcript after audio-stop (HA will take first event): {text[:50]}...")
+                            return
                         event_data = {"text": text, "final": is_final}  # Matches faster-whisper: false=interim, true=final
                         # Add timestamps if available (like faster-whisper)
                         if start is not None:
@@ -931,19 +942,28 @@ class EventHandler(AsyncEventHandler):
         elif event.type == "audio-stop":
             logger.info(f"Received Wyoming event: {event.type} - Data: {event.data}")
             
+            # Mark that audio-stop was received - stop sending interim transcripts
+            # HA's STT provider only reads ONE transcript after audio-stop
+            if self.streaming_active:
+                self.audio_stop_received = True
+            
             if self.streaming_active and self.streaming_connection:
                 # Streaming mode: finalize the stream
                 try:
                     session = self.streaming_connection
                     loop = asyncio.get_event_loop()
                     
-                    # Get latest transcript before processing (for comparison later)
-                    # We don't send it immediately - we'll wait for the refined final transcript
-                    latest_transcript = session.get_final_transcript().strip()
-                    if not latest_transcript:
-                        latest_transcript = self.streaming_transcript.strip()
+                    # CRITICAL: Get and send latest transcript when audio-stop is received
+                    # Home Assistant's STT provider starts reading events right after audio-stop
+                    # We need to wait a brief moment to let any in-flight Deepgram updates arrive
+                    # Then send the best transcript we have, then refine it later if needed
                     
-                    # Send final chunk if any remaining audio (after sending transcript)
+                    # Don't send transcript immediately - wait for debounce to get the most complete transcript
+                    # Sending immediately causes inconsistent results (sometimes incomplete transcripts)
+                    # Instead, we'll wait for the debounce period to ensure we get the best transcript
+                    latest_transcript = None  # Will be set after debounce
+                    
+                    # Send final chunk if any remaining audio
                     if self.audio_data:
                         session.send_media(self.audio_data)
                     
@@ -959,27 +979,61 @@ class EventHandler(AsyncEventHandler):
                     await loop.run_in_executor(None, finish_stream)
                     
                     # Wait for Deepgram to finish processing and send final transcript
-                    # Reduced timeout to match faster-whisper's responsiveness (0.5s)
-                    # We already send progressive updates, so we just need a brief wait for final refinement
-                    def wait_for_end():
-                        return session.wait_for_completion(timeout=0.5)  # Fast like faster-whisper
-
-                    completed = await loop.run_in_executor(None, wait_for_end)
-                    if not completed:
-                        logger.debug("EndOfTurn not received (timeout), using latest transcript")
+                    # Use debounce approach: wait until no new transcripts arrive for a period
+                    # This ensures we get the most refined transcript, not an early incomplete one
+                    # Note: Deepgram doesn't specify a fixed debounce time - this is based on our testing
+                    # We wait for debounce to ensure consistent, complete transcripts
+                    # Deepgram's Flux model has end-of-turn detection, but we use debounce for additional safety
+                    debounce_seconds = 0.8  # Wait 0.8s after last update before sending final (tuned for speed + completeness)
+                    max_wait_seconds = 2.5  # Maximum wait time (safety timeout)
                     
-                    # Get the final transcript after Deepgram has finished processing
+                    def wait_for_stable_transcript():
+                        """Wait until transcript stabilizes (no updates for debounce period)"""
+                        start_time = time.monotonic()
+                        
+                        while True:
+                            elapsed = time.monotonic() - start_time
+                            
+                            # Check if we've exceeded max wait
+                            if elapsed >= max_wait_seconds:
+                                logger.debug(f"Max wait time ({max_wait_seconds}s) reached")
+                                return True
+                            
+                            # Check if EndOfTurn was received
+                            if session.end_of_turn.is_set():
+                                logger.debug("EndOfTurn received")
+                                return True
+                            
+                            # Check if transcript has been updated recently
+                            with session._lock:
+                                if session.last_update_time is not None:
+                                    time_since_update = time.monotonic() - session.last_update_time
+                                    if time_since_update >= debounce_seconds:
+                                        logger.debug(f"Transcript stable for {time_since_update:.2f}s (>= {debounce_seconds}s)")
+                                        return True
+                                else:
+                                    # No updates received yet, wait a bit more
+                                    if elapsed >= debounce_seconds:
+                                        logger.debug(f"No transcript updates received, waiting {elapsed:.2f}s")
+                                        return True
+                            
+                            # Sleep briefly before checking again
+                            time.sleep(0.1)
+                    
+                    logger.info(f"Waiting for transcript to stabilize (debounce: {debounce_seconds}s, max: {max_wait_seconds}s)...")
+                    await loop.run_in_executor(None, wait_for_stable_transcript)
+                    
+                    # Get the final transcript after debounce period
                     final_transcript = session.get_final_transcript().strip()
                     if not final_transcript:
                         final_transcript = self.streaming_transcript.strip()
                     
-                    logger.info(f"📋 Final transcript after processing: '{final_transcript}' (length: {len(final_transcript)})")
+                    logger.info(f"📋 Final transcript after stabilization: '{final_transcript}' (length: {len(final_transcript)})")
                     logger.info(f"📋 Last streaming transcript: '{self.streaming_transcript}' (length: {len(self.streaming_transcript)})")
                     
-                    # Send the final transcript (only one final=true event, like faster-whisper)
-                    # Matches faster-whisper: final=true for final transcript
+                    # Send the final transcript (after debounce wait ensures we get the most complete one)
+                    # This is the only transcript we send - ensures consistency
                     if final_transcript:
-                        # Always send the final transcript with final=true (only one final event)
                         result_event = Event(
                             type="transcript",
                             data={"text": final_transcript, "final": True},  # final=true for final (like faster-whisper)
@@ -1000,6 +1054,7 @@ class EventHandler(AsyncEventHandler):
                     await loop.run_in_executor(None, close_stream)
                     self.streaming_active = False
                     self.streaming_ready = False  # Reset ready flag
+                    self.audio_stop_received = False  # Reset for next session
                     self.audio_data = b""
                     logger.info("✅ Streaming transcription finalized")
                     
