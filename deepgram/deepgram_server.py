@@ -598,7 +598,7 @@ class StreamingSession:
                             transcript_start = getattr(alt, 'start', None)
                             transcript_end = getattr(alt, 'end', None)
                             if transcript_text:
-                            logger.debug(f"✅ Found transcript in channel.alternatives: {transcript_text[:50]}...")
+                                logger.debug(f"✅ Found transcript in channel.alternatives: {transcript_text[:50]}...")
                     
                     # Check for direct transcript attribute
                     if not transcript_text and hasattr(message, 'transcript'):
