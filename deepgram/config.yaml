@@ -14,4 +14,4 @@ schema:
   api_key: str
   model: str?
   debug: bool?
-  streaming_mode: str?
+  streaming: bool?

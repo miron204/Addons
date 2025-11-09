@@ -851,15 +851,13 @@ class EventHandler(AsyncEventHandler):
         model = config.get("model", "flux-general-en")  # Default to Flux for streaming
         logger.info(f"Using Deepgram model: {model}")
         
-        # Streaming mode: "batch" or "streaming"
-        # - "batch": Accumulate all audio, process at end (like faster-whisper)
-        # - "streaming": Send audio in real-time, get progressive updates
-        # Default to "batch" for better HA compatibility
-        self.streaming_mode = config.get("streaming_mode", "batch").lower()
-        if self.streaming_mode not in ["batch", "streaming"]:
-            logger.warning(f"Invalid streaming_mode '{self.streaming_mode}', defaulting to 'batch'")
-            self.streaming_mode = "batch"
-        logger.info(f"🔧 Processing mode: {self.streaming_mode.upper()}")
+        # Streaming mode: false (batch) or true (streaming)
+        # - false/batch: Accumulate all audio, process at end (like faster-whisper)
+        # - true/streaming: Send audio in real-time, get progressive updates
+        # Default to false (batch) for better HA compatibility
+        self.streaming_mode = config.get("streaming", False)
+        mode_name = "STREAMING" if self.streaming_mode else "BATCH"
+        logger.info(f"🔧 Processing mode: {mode_name}")
         
         self.stt = DeepgramSTT(model=model)
         self.audio_data = b""
@@ -887,10 +885,10 @@ class EventHandler(AsyncEventHandler):
             # Reset flags for new audio stream
             self.audio_stop_received = False
             
-            # For Flux models, decide based on streaming_mode setting
-            # - "streaming": Start real-time streaming connection
-            # - "batch": Use batch processing (accumulate audio, process at end)
-            if self.stt.is_flux and self.streaming_mode == "streaming":
+            # For Flux models, decide based on streaming setting
+            # - true (streaming): Start real-time streaming connection
+            # - false (batch): Use batch processing (accumulate audio, process at end)
+            if self.stt.is_flux and self.streaming_mode:
                 try:
                     self.streaming_transcript = ""
                     self.streaming_ready = False  # Reset ready flag for new connection
@@ -1086,9 +1084,10 @@ class EventHandler(AsyncEventHandler):
             else:
                 # Batch mode: process accumulated audio
                 text = await self.stt.transcribe(self.audio_data, self.sample_rate)
-                result_event = Event(type="transcript", data={"text": text})
+                # In batch mode, we only send ONE transcript, so it's always final=true
+                result_event = Event(type="transcript", data={"text": text, "final": True})
                 
-                logger.info(f"Sending Transcript Event: {text}")
+                logger.info(f"Sending Transcript Event (BATCH mode, final=True): {text}")
                 
                 await self._safe_write_event(result_event)
                 self.audio_data = b""  # Reset for next transcription

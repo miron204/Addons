@@ -25,15 +25,17 @@ This Home Assistant add-on provides speech-to-text (STT) functionality using Dee
     - `nova-3` - Balanced accuracy and speed
     - `whisper-large` - OpenAI Whisper model
 
-- **`streaming_mode`** (string, default: `"batch"`): Processing mode for audio
-  - `"batch"`: Accumulate all audio, process at end (like faster-whisper)
-    - ✅ Simpler, more predictable
+- **`streaming`** (boolean, default: `false`): Processing mode for audio
+  - `false` (Batch mode - Recommended):
+    - ✅ Accumulate all audio, process at end (like faster-whisper)
     - ✅ Better Home Assistant compatibility
     - ✅ One complete final transcript
+    - ✅ Simpler, more predictable
     - ❌ No real-time interim updates
-  - `"streaming"`: Send audio in real-time, get progressive updates
+  - `true` (Streaming mode):
+    - ✅ Send audio in real-time, get progressive updates
     - ✅ Real-time interim transcripts during speech
-    - ✅ Faster response times
+    - ✅ Faster initial response (~100ms faster)
     - ❌ More complex processing
     - ⚠️ May have timing issues with some setups
 
@@ -48,8 +50,7 @@ This Home Assistant add-on provides speech-to-text (STT) functionality using Dee
 {
   "api_key": "your_deepgram_api_key_here",
   "model": "flux-general-en",
-  "streaming_mode": "batch",
-  "debug": false
+  "streaming": false
 }
 ```
 
@@ -58,10 +59,39 @@ This Home Assistant add-on provides speech-to-text (STT) functionality using Dee
 {
   "api_key": "your_deepgram_api_key_here",
   "model": "flux-general-en",
-  "streaming_mode": "streaming",
-  "debug": false
+  "streaming": true
 }
 ```
+
+### With Debug Mode
+```json
+{
+  "api_key": "your_deepgram_api_key_here",
+  "model": "flux-general-en",
+  "streaming": false,
+  "debug": true
+}
+```
+
+## How It Works
+
+### Home Assistant → Wyoming Client → Your Server
+
+Home Assistant always sends audio chunks in real-time via Wyoming protocol. The `streaming` setting controls how **your server** processes those chunks:
+
+- **`streaming: false` (Batch)**:
+  ```
+  HA → [chunk, chunk, chunk] → audio-stop → [Process ALL chunks at once] → ONE final transcript → HA
+  ```
+
+- **`streaming: true`**:
+  ```
+  HA → chunk → [Process immediately] → interim transcript → HA
+      → chunk → [Process immediately] → interim transcript → HA  
+      → audio-stop → final transcript → HA
+  ```
+
+**Note:** Home Assistant's STT provider reads the FIRST transcript after `audio-stop`, so batch mode ensures that first transcript is complete and final.
 
 ## Troubleshooting
 
@@ -71,9 +101,7 @@ If you're experiencing issues, enable debug mode to see detailed logs:
 
 ```json
 {
-  "api_key": "your_deepgram_api_key_here",
-  "model": "flux-general-en",
-  "streaming_mode": "batch",
+  "streaming": false,
   "debug": true
 }
 ```
@@ -82,9 +110,9 @@ If you're experiencing issues, enable debug mode to see detailed logs:
 
 If you're getting incomplete transcripts in Home Assistant:
 
-1. **Switch to batch mode** (recommended):
+1. **Use batch mode** (recommended):
    ```json
-   "streaming_mode": "batch"
+   "streaming": false
    ```
 
 2. **Check your model**: Flux models work best with this add-on
@@ -109,6 +137,17 @@ python3 test_wyoming_client.py --file your_audio.wav
 # Test with microphone (requires pyaudio/sounddevice)
 python3 test_client_flux.py
 ```
+
+## Performance Comparison
+
+Based on testing with a 3-second audio sample:
+
+| Mode | First Response | Final Response | Transcript Updates |
+|------|---------------|----------------|-------------------|
+| **Batch** (`false`) | ~2.4s | ~2.4s | 1 (final only) |
+| **Streaming** (`true`) | ~1.3s | ~2.3s | 3 (2 interim + 1 final) |
+
+**Recommendation:** Use batch mode (`streaming: false`) for Home Assistant - the tiny speed difference isn't worth the complexity.
 
 ## Support
 
