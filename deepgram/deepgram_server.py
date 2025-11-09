@@ -524,6 +524,7 @@ class StreamingSession:
         self.connection_context = None
         self.final_transcript = ""
         self.last_sent_transcript = ""
+        self.latest_transcript = ""
         self.listening_thread = None
         self._lock = threading.Lock()
         self.end_of_turn = threading.Event()
@@ -615,6 +616,8 @@ class StreamingSession:
                     if transcript_text and transcript_text.strip():
                         text = transcript_text.strip()
                         with self._lock:
+                            # Track the most recent non-empty transcript regardless of final status
+                            self.latest_transcript = text
                             # Treat None as interim (send it), only False means skip
                             final_flag = bool(is_final) if is_final is not None else False
                             old_length = len(self.final_transcript) if self.final_transcript else 0
@@ -1041,23 +1044,28 @@ class EventHandler(AsyncEventHandler):
                     # Get the final transcript after debounce period
                     final_transcript = session.get_final_transcript().strip()
                     if not final_transcript:
+                        # Fall back to the latest transcript observed during streaming
+                        final_transcript = session.latest_transcript.strip()
+                    if not final_transcript:
                         final_transcript = self.streaming_transcript.strip()
+                    # Keep local cache in sync for logging/fallbacks
+                    self.streaming_transcript = final_transcript
                     
                     logger.info(f"📋 Final transcript after stabilization: '{final_transcript}' (length: {len(final_transcript)})")
                     logger.info(f"📋 Last streaming transcript: '{self.streaming_transcript}' (length: {len(self.streaming_transcript)})")
                     
                     # Send the final transcript (after debounce wait ensures we get the most complete one)
                     # This is the only transcript we send - ensures consistency
-                    if final_transcript:
-                        result_event = Event(
-                            type="transcript",
-                            data={"text": final_transcript, "final": True},  # final=true for final (like faster-whisper)
-                        )
-                        logger.info(f"📤 Sending FINAL transcript (final=True): {final_transcript[:80]}...")
-                        await self._safe_write_event(result_event)
-                        session.final_sent = True
-                    else:
-                        logger.warning("No final transcript available after processing")
+                    if not final_transcript:
+                        logger.warning("No final transcript available after processing, sending empty result to unblock client")
+                        final_transcript = ""
+                    result_event = Event(
+                        type="transcript",
+                        data={"text": final_transcript, "final": True},  # final=true for final (like faster-whisper)
+                    )
+                    logger.info(f"📤 Sending FINAL transcript (final=True): {final_transcript[:80]}...")
+                    await self._safe_write_event(result_event)
+                    session.final_sent = True
                     
                     # Close the connection
                     def close_stream():
