@@ -658,12 +658,14 @@ class StreamingSession:
             
             def on_close(_):
                 logger.debug("Streaming connection closed")
+                self.connection = None
                 self.end_of_turn.set()
             
             def on_error(error):
                 error_code = getattr(error, 'code', None)
                 error_desc = getattr(error, 'description', None)
                 logger.error(f"Streaming connection error: code={error_code}, description={error_desc}, error={error}")
+                self.connection = None
                 self.end_of_turn.set()
 
             def on_end_of_turn(_):
@@ -741,12 +743,14 @@ class StreamingSession:
     
     def send_media(self, chunk: bytes):
         """Send audio chunk to the streaming connection (like faster-whisper processes chunks incrementally)"""
-        if self.connection:
-            try:
-                # SDK 5.3.0+ uses send_media() method
-                self.connection.send_media(chunk)
-            except Exception as e:
-                logger.error(f"Error sending chunk to streaming connection: {e}", exc_info=True)
+        if not self.connection or self.end_of_turn.is_set():
+            logger.debug("Skipping chunk send: streaming connection is not active.")
+            return
+        try:
+            # SDK 5.3.0+ uses send_media() method
+            self.connection.send_media(chunk)
+        except Exception as e:
+            logger.error(f"Error sending chunk to streaming connection: {e}", exc_info=True)
 
     def wait_for_completion(self, timeout: float = 3.0) -> bool:
         """Block until Deepgram signals the end of the turn or timeout expires."""
@@ -872,8 +876,34 @@ class EventHandler(AsyncEventHandler):
         self.streaming_transcript = ""
         self.streaming_ready = False  # Track if connection is ready (avoid repeated waits)
         self.audio_stop_received = False  # Track when audio-stop is received (to prevent sending interim transcripts)
+        self.last_audio_chunk_time = None
+        self.idle_timeout_seconds = 30.0
+        self._idle_timeout_handle = None
         wyoming_info = self.WYOMING_INFO
         self.wyoming_info_event = wyoming_info.event()
+
+    def _cancel_idle_timeout(self) -> None:
+        if self._idle_timeout_handle:
+            self._idle_timeout_handle.cancel()
+            self._idle_timeout_handle = None
+
+    def _schedule_idle_timeout(self) -> None:
+        if not self.streaming_active:
+            return
+        self._cancel_idle_timeout()
+        loop = asyncio.get_running_loop()
+        self._idle_timeout_handle = loop.call_later(
+            self.idle_timeout_seconds,
+            lambda: asyncio.create_task(self._idle_timeout_expired()),
+        )
+
+    async def _idle_timeout_expired(self) -> None:
+        if not self.streaming_active or self.audio_stop_received:
+            return
+        self._cancel_idle_timeout()
+        logger.warning(f"No audio received for {self.idle_timeout_seconds:.0f}s; forcing audio-stop.")
+        self.audio_stop_received = True
+        await self.handle_event(Event(type="audio-stop", data={"timestamp": None, "reason": "idle_timeout"}))
 
     async def handle_event(self, event: Event) -> bool:
         """Process and log all incoming Wyoming protocol events."""
@@ -889,6 +919,9 @@ class EventHandler(AsyncEventHandler):
             
             # Reset flags for new audio stream
             self.audio_stop_received = False
+            # Track last time we received audio to enforce idle timeout
+            self.last_audio_chunk_time = time.monotonic()
+            self._cancel_idle_timeout()
             
             # For Flux models, decide based on streaming setting
             # - true (streaming): Start real-time streaming connection
@@ -927,15 +960,20 @@ class EventHandler(AsyncEventHandler):
                     # Reduced timeout since connection should be ready quickly after OPEN event
                     await self.streaming_connection.wait_for_ready(timeout=0.5)
                     self.streaming_ready = True
+                    self.last_audio_chunk_time = time.monotonic()
+                    self._schedule_idle_timeout()
                     logger.info("✅ Started streaming transcription - ready to receive audio chunks")
                 except Exception as e:
                     logger.error(f"❌ Failed to start streaming: {e}", exc_info=True)
+                    self._cancel_idle_timeout()
                     self.streaming_active = False
+                    self.last_audio_chunk_time = None
                     # Fallback: will use batch mode on audio-stop
             else:
                 # For non-Flux models, use batch mode
                 self.streaming_active = False
                 self.audio_data = b""
+                self.last_audio_chunk_time = time.monotonic()
         elif event.type == "audio-chunk":
             if self.streaming_active and self.streaming_connection:
                 # Streaming mode: send chunk immediately to Deepgram
@@ -952,6 +990,8 @@ class EventHandler(AsyncEventHandler):
                     # Send chunk directly (StreamingSession handles thread safety)
                     self.streaming_connection.send_media(chunk)
                     logger.debug(f"📤 Sent audio chunk to Deepgram: {chunk_size} bytes")
+                    self.last_audio_chunk_time = time.monotonic()
+                    self._schedule_idle_timeout()
                 except Exception as e:
                     logger.error(f"Error processing streaming audio chunk: {e}", exc_info=True)
             else:
@@ -964,6 +1004,7 @@ class EventHandler(AsyncEventHandler):
             # HA's STT provider only reads ONE transcript after audio-stop
             if self.streaming_active:
                 self.audio_stop_received = True
+            self._cancel_idle_timeout()
             
             if self.streaming_active and self.streaming_connection:
                 # Streaming mode: finalize the stream
@@ -1015,6 +1056,11 @@ class EventHandler(AsyncEventHandler):
                             # Check if we've exceeded max wait
                             if elapsed >= max_wait_seconds:
                                 logger.debug(f"Max wait time ({max_wait_seconds}s) reached")
+                                return True
+                            
+                            # Abort if we've been idle (no audio) beyond timeout to avoid ping disconnect
+                            if self.last_audio_chunk_time and (time.monotonic() - self.last_audio_chunk_time) >= self.idle_timeout_seconds:
+                                logger.warning(f"Idle timeout reached (no audio for {self.idle_timeout_seconds:.0f}s); finalizing stream early")
                                 return True
                             
                             # Check if EndOfTurn was received
@@ -1079,6 +1125,7 @@ class EventHandler(AsyncEventHandler):
                     self.streaming_ready = False  # Reset ready flag
                     self.audio_stop_received = False  # Reset for next session
                     self.audio_data = b""
+                    self.last_audio_chunk_time = None
                     logger.info("✅ Streaming transcription finalized")
                     
                     self.streaming_transcript = ""
