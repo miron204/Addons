@@ -43,7 +43,7 @@ async def read_events(client: AsyncClient, timeout: float = 10.0):
     start_time = asyncio.get_event_loop().time()
     final_received = False
     final_received_time = None
-    grace_period = 0.5  # Wait 0.5s after final transcript to ensure no more events
+    grace_period = 0.1  # Small grace period after final=true to catch any late refinements
     
     try:
         while True:
@@ -55,14 +55,17 @@ async def read_events(client: AsyncClient, timeout: float = 10.0):
                     text = event.data.get("text", "") if event.data else ""
                     is_final = event.data.get("final", False) if event.data else False
                     transcripts.append((elapsed, text, is_final))
+                    
+                    status = "FINAL" if is_final else "interim"
                     logger.info(
-                        f"[{elapsed:.2f}s] 📝 Transcript ({'FINAL' if is_final else 'interim'}): {text}"
+                        f"[{elapsed:.2f}s] 📝 Transcript ({status}): {text}"
                     )
                     
-                    # Track when final transcript is received
-                    if is_final:
+                    # Track when final transcript is received (faster-whisper uses final: true)
+                    if is_final and not final_received:
                         final_received = True
                         final_received_time = asyncio.get_event_loop().time()
+                        logger.info("✅ Received final transcript (final=true)")
                 else:
                     logger.info(f"[{elapsed:.2f}s] 📨 Event: {event.type} - {event.data}")
                     
@@ -170,19 +173,22 @@ async def test_wyoming_server(
         logger.info("TRANSCRIPT SUMMARY:")
         logger.info("=" * 60)
         if transcripts:
+            # Show all transcripts with final status
             for elapsed, text, is_final in transcripts:
                 status = "FINAL" if is_final else "interim"
-                logger.info(f"  [{elapsed:.2f}s] [{status}] {text}")
+                logger.info(f"  [{elapsed:.2f}s] ({status}) {text}")
             
-            # Show final transcript
-            final_transcripts = [t for t in transcripts if t[2]]
+            # Show final transcript (marked with final=true)
+            final_transcripts = [t for t in transcripts if t[2]]  # Filter by is_final=True
             if final_transcripts:
-                final_text = final_transcripts[-1][1]
-                logger.info(f"\n✅ Final transcript: {final_text}")
+                final_text = final_transcripts[-1][1]  # Get text from last final transcript
+                logger.info(f"\n✅ Final transcript (final=true): {final_text}")
+            elif transcripts:
+                # Fallback: show last transcript if no final was received
+                final_text = transcripts[-1][1]
+                logger.warning(f"\n⚠️  No final transcript received, showing last: {final_text}")
             else:
-                logger.warning("\n⚠️  No final transcript received!")
-                if transcripts:
-                    logger.info(f"   Last interim: {transcripts[-1][1]}")
+                logger.warning("\n⚠️  No transcripts received!")
         else:
             logger.error("❌ No transcripts received!")
 

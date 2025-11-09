@@ -574,6 +574,8 @@ class StreamingSession:
                     logger.debug(f"  Message attributes: {[attr for attr in dir(message) if not attr.startswith('_') and not callable(getattr(message, attr, None))]}")
                     
                     # Check for channel.alternatives pattern (most common for v2 API)
+                    transcript_start = None
+                    transcript_end = None
                     if hasattr(message, 'channel'):
                         channel = message.channel
                         logger.debug(f"  Found channel: {channel}")
@@ -581,6 +583,9 @@ class StreamingSession:
                             alt = channel.alternatives[0]
                             logger.debug(f"  Alternative: {alt}")
                             transcript_text = getattr(alt, 'transcript', None)
+                            # Extract timing information if available (like faster-whisper)
+                            transcript_start = getattr(alt, 'start', None)
+                            transcript_end = getattr(alt, 'end', None)
                             if transcript_text:
                                 logger.info(f"✅ Found transcript in channel.alternatives: {transcript_text[:50]}...")
                     
@@ -618,16 +623,17 @@ class StreamingSession:
                                 if text != self.last_sent_transcript:
                                     self.last_sent_transcript = text
                                     try:
+                                        # Call callback with final flag and timestamps (faster-whisper includes start/end)
                                         asyncio.run_coroutine_threadsafe(
-                                            self.transcript_callback(text, final_flag),
+                                            self.transcript_callback(text, final_flag, transcript_start, transcript_end),
                                             self.event_loop
                                         )
-                                        logger.info(f"📤 Sent streaming transcript ({'final' if final_flag else 'interim'}): {text[:50]}...")
+                                        logger.info(f"📤 Sent streaming transcript (final={final_flag}): {text[:50]}...")
                                     except Exception as e:
                                         logger.error(f"Error calling transcript callback: {e}", exc_info=True)
                                     
                                     if final_flag:
-                                        self.final_sent = True
+                                        self.final_sent = True  # Track internally for our own logic
                             else:
                                 logger.debug(f"Ignoring shorter fragment: {new_length} chars (keeping {old_length} chars)")
                 except Exception as e:
@@ -646,16 +652,16 @@ class StreamingSession:
             def on_end_of_turn(_):
                 logger.info("🔚 EndOfTurn received - sending final transcript")
                 self.end_of_turn.set()
-                # Send the final transcript when EndOfTurn is received
+                # Send the final transcript when EndOfTurn is received (final=true like faster-whisper)
                 with self._lock:
                     if self.final_transcript and not self.final_sent:
                         try:
                             asyncio.run_coroutine_threadsafe(
-                                self.transcript_callback(self.final_transcript, True),  # final=True
+                                self.transcript_callback(self.final_transcript, True),  # final=true
                                 self.event_loop
                             )
                             self.final_sent = True
-                            logger.info(f"📤 Sent FINAL transcript on EndOfTurn: {self.final_transcript[:80]}...")
+                            logger.info(f"📤 Sent transcript on EndOfTurn (final=True): {self.final_transcript[:80]}...")
                         except Exception as e:
                             logger.error(f"Error sending final transcript on EndOfTurn: {e}", exc_info=True)
             
@@ -868,14 +874,19 @@ class EventHandler(AsyncEventHandler):
                     self.streaming_transcript = ""
                     self.streaming_ready = False  # Reset ready flag for new connection
                     # Define callback to capture progressive transcripts (send immediately like faster-whisper)
-                    async def send_transcript(text: str, is_final: bool):
+                    # faster-whisper uses final: false for interim, final: true for final
+                    # faster-whisper also includes start/end timestamps
+                    async def send_transcript(text: str, is_final: bool = False, start: float = None, end: float = None):
                         self.streaming_transcript = text
-                        result_event = Event(
-                            type="transcript",
-                            data={"text": text, "final": is_final},
-                        )
+                        event_data = {"text": text, "final": is_final}  # Matches faster-whisper: false=interim, true=final
+                        # Add timestamps if available (like faster-whisper)
+                        if start is not None:
+                            event_data["start"] = start
+                        if end is not None:
+                            event_data["end"] = end
+                        result_event = Event(type="transcript", data=event_data)
                         await self._safe_write_event(result_event)
-                        logger.info(f"📤 Sent streaming transcript ({'FINAL' if is_final else 'interim'}): {text[:80]}...")
+                        logger.info(f"📤 Sent streaming transcript (final={is_final}): {text[:80]}...")
                     
                     logger.info(f"🔄 Starting streaming connection for Flux model...")
                     self.streaming_connection = await self.stt.start_streaming(
@@ -926,30 +937,11 @@ class EventHandler(AsyncEventHandler):
                     session = self.streaming_connection
                     loop = asyncio.get_event_loop()
                     
-                    # CRITICAL: Get and send transcript IMMEDIATELY before any blocking operations
-                    # Home Assistant's STT provider waits for the first Transcript event after audio-stop
-                    # If it doesn't receive one quickly, it may timeout and disconnect
-                    # We MUST send the transcript synchronously before doing anything else
+                    # Get latest transcript before processing (for comparison later)
+                    # We don't send it immediately - we'll wait for the refined final transcript
                     latest_transcript = session.get_final_transcript().strip()
                     if not latest_transcript:
                         latest_transcript = self.streaming_transcript.strip()
-                    
-                    # Send immediately as FINAL - HA expects final=True when audio stops
-                    # This must be sent BEFORE finish_stream() to ensure HA receives it
-                    if latest_transcript:
-                        result_event = Event(
-                            type="transcript",
-                            data={"text": latest_transcript, "final": True},
-                        )
-                        # Use write_event directly (not _safe_write_event) to ensure it's sent immediately
-                        # We want to know if there's an error sending it
-                        try:
-                            await self.write_event(result_event)
-                            logger.info(f"📤 Sent IMMEDIATE final transcript: {latest_transcript[:80]}...")
-                            session.final_sent = True
-                        except (BrokenPipeError, ConnectionResetError, TypeError) as e:
-                            logger.warning(f"Failed to send immediate transcript (client may have disconnected): {e}")
-                            # Client already disconnected, but continue to clean up
                     
                     # Send final chunk if any remaining audio (after sending transcript)
                     if self.audio_data:
@@ -984,24 +976,17 @@ class EventHandler(AsyncEventHandler):
                     logger.info(f"📋 Final transcript after processing: '{final_transcript}' (length: {len(final_transcript)})")
                     logger.info(f"📋 Last streaming transcript: '{self.streaming_transcript}' (length: {len(self.streaming_transcript)})")
                     
-                    # Only send refined transcript if it's different from what we already sent
-                    # Home Assistant may have already disconnected, but we'll try to send the refined version
+                    # Send the final transcript (only one final=true event, like faster-whisper)
+                    # Matches faster-whisper: final=true for final transcript
                     if final_transcript:
-                        if latest_transcript and final_transcript == latest_transcript:
-                            # Same transcript - already sent, no need to send again
-                            logger.debug(f"Final transcript unchanged, already sent: {final_transcript[:50]}...")
-                        else:
-                            # Different transcript OR no immediate was sent - send the refined/final version
-                            result_event = Event(
-                                type="transcript",
-                                data={"text": final_transcript, "final": True},
-                            )
-                            if latest_transcript:
-                                logger.info(f"📤 Sending REFINED final transcript: {final_transcript[:80]}...")
-                            else:
-                                logger.info(f"📤 Sending final transcript (no immediate was sent): {final_transcript[:80]}...")
-                            await self._safe_write_event(result_event)
-                            session.final_sent = True
+                        # Always send the final transcript with final=true (only one final event)
+                        result_event = Event(
+                            type="transcript",
+                            data={"text": final_transcript, "final": True},  # final=true for final (like faster-whisper)
+                        )
+                        logger.info(f"📤 Sending FINAL transcript (final=True): {final_transcript[:80]}...")
+                        await self._safe_write_event(result_event)
+                        session.final_sent = True
                     else:
                         logger.warning("No final transcript available after processing")
                     
